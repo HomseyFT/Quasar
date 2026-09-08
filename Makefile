@@ -1,4 +1,4 @@
-DEPLOY_HOST ?= nathanwebserver
+DEPLOY_HOST ?= nathan1@100.77.169.69
 DEPLOY_PATH ?= /usr/local/bin/quasar
 
 MUSL_TARGET := x86_64-unknown-linux-musl

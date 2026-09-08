@@ -14,7 +14,7 @@ fn exec_probe_relocates_against_target_kernel() {
     let Ok(btf) = Btf::parse_file(TARGET_BTF, Endianness::default()) else {
         panic!(
             "cannot read {TARGET_BTF}. Fetch it from the deployment target:\n    \
-             scp nathanwebserver:/sys/kernel/btf/vmlinux {TARGET_BTF}"
+             scp nathan1@100.77.169.69:/sys/kernel/btf/vmlinux {TARGET_BTF}"
         );
     };
 

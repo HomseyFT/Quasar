@@ -17,6 +17,8 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 aya = "0.13"
+bollard = "0.21"
+futures-util = { version = "0.3", default-features = false }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 log = "0.4"

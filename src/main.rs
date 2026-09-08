@@ -1,10 +1,21 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use aya::maps::RingBuf;
 use clap::{Parser, Subcommand};
-use quasar::{event::ExecEvent, loader};
-use tokio::io::unix::AsyncFd;
+use quasar::{
+    event::ExecEvent,
+    loader,
+    registry::{Attribution, Registry},
+};
+use tokio::{io::unix::AsyncFd, sync::mpsc};
+
+/// Bounded so a container in a crash-loop cannot grow the queue without limit.
+/// Overflow is counted and reported rather than allowed to stall the drain.
+const EVENT_QUEUE_DEPTH: usize = 4096;
 
 #[derive(Parser)]
 #[command(name = "quasar", version, about = "eBPF container security monitor")]
@@ -20,6 +31,11 @@ enum Command {
         /// Relocate against this BTF blob instead of the running kernel.
         #[arg(long, value_name = "PATH")]
         btf: Option<PathBuf>,
+
+        /// Docker endpoint. Defaults to the local unix socket; pass a
+        /// host:port to use docker-socket-proxy instead.
+        #[arg(long, value_name = "ENDPOINT")]
+        docker: Option<String>,
     },
 }
 
@@ -28,21 +44,51 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     match Cli::parse().command {
-        Command::Run { btf } => run(btf.as_deref()).await,
+        Command::Run { btf, docker } => run(btf.as_deref(), docker.as_deref()).await,
     }
 }
 
-async fn run(btf: Option<&Path>) -> Result<()> {
+async fn run(btf: Option<&Path>, docker: Option<&str>) -> Result<()> {
     let mut ebpf = loader::load_exec(btf)?;
     loader::attach_exec(&mut ebpf)?;
+
+    // A registry that cannot reach Docker still resolves container ids, so an
+    // unreachable daemon degrades the output rather than stopping the monitor.
+    let registry = Arc::new(match Registry::connect(docker).await {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("quasar: Docker unavailable ({error:#}); events will not be named");
+            Registry::offline()
+        }
+    });
 
     let events = ebpf
         .map_mut("events")
         .context("no events map in the exec object")?;
     let mut ring = AsyncFd::new(RingBuf::try_from(events)?)?;
 
+    // Attribution can await a Docker round trip, which must never stall the
+    // ring buffer drain -- the kernel would overwrite records while we waited.
+    let (tx, mut rx) = mpsc::channel::<ExecEvent>(EVENT_QUEUE_DEPTH);
+
+    let consumer = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move {
+            while let Some(event) = rx.recv().await {
+                let who = registry.resolve(event.cgroup_id, event.pid).await;
+                print_exec(&who, &event);
+            }
+        }
+    });
+
+    let watcher = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.watch().await }
+    });
+
     eprintln!("quasar: attached to sched:sched_process_exec, ctrl-c to stop");
 
+    let mut dropped: u64 = 0;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -53,13 +99,16 @@ async fn run(btf: Option<&Path>) -> Result<()> {
                 let mut guard = readable.context("polling the ring buffer")?;
                 let ring = guard.get_inner_mut();
                 while let Some(record) = ring.next() {
-                    match ExecEvent::from_bytes(&record) {
-                        Some(event) => print_exec(&event),
-                        None => eprintln!(
+                    let Some(event) = ExecEvent::from_bytes(&record) else {
+                        eprintln!(
                             "quasar: dropped a {}-byte ring buffer record, too short for an \
                              exec_event -- probe and loader disagree about the format",
                             record.len()
-                        ),
+                        );
+                        continue;
+                    };
+                    if tx.try_send(event).is_err() {
+                        dropped += 1;
                     }
                 }
                 guard.clear_ready();
@@ -67,21 +116,31 @@ async fn run(btf: Option<&Path>) -> Result<()> {
         }
     }
 
+    drop(tx);
+    let _ = consumer.await;
+    watcher.abort();
+
+    if dropped > 0 {
+        eprintln!("quasar: {dropped} events dropped, attribution could not keep up");
+    }
     eprintln!("quasar: detaching");
     Ok(())
 }
 
-fn print_exec(e: &ExecEvent) {
+fn print_exec(who: &Attribution, e: &ExecEvent) {
     println!(
-        "[{:>14.6}] cgroup={} pid={} tgid={} ppid={} uid={} gid={} comm={} file={}",
+        "[{:>14.6}] {:<24} pid={} ppid={} uid={} comm={} file={}{}",
         e.timestamp_ns as f64 / 1e9,
-        e.cgroup_id,
+        who.to_string(),
         e.pid,
-        e.tgid,
         e.ppid,
         e.uid,
-        e.gid,
         e.comm(),
         e.filename(),
+        if who.is_attributed() {
+            ""
+        } else {
+            "  [unattributed]"
+        },
     );
 }
