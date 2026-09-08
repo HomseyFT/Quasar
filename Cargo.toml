@@ -1,0 +1,36 @@
+[package]
+name = "quasar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "eBPF container security monitor"
+license = "MIT"
+
+[[bin]]
+name = "quasar"
+path = "src/main.rs"
+
+[lib]
+name = "quasar"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+aya = "0.13"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+
+[build-dependencies]
+bindgen = "0.72"
+
+[dev-dependencies]
+aya-obj = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
