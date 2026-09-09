@@ -5,7 +5,7 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 BIN         := target/$(MUSL_TARGET)/release/quasar
 TARGET_BTF  := testdata/btf/ubuntu-6.8.0-139
 
-.PHONY: all build dev run test lint vmlinux deps deploy soak clean
+.PHONY: all build dev run test accept lint vmlinux deps deploy soak clean
 
 all: build
 
@@ -23,6 +23,12 @@ run: dev
 
 test: bpf/vmlinux.h
 	cargo test
+
+## accept: every phase's acceptance criteria against real containers (needs root)
+# PHASES=3 make accept  runs just one phase.
+PHASES ?=
+accept: dev
+	sudo QUASAR_TEST_ROOT=1 bash scripts/acceptance.sh $(PHASES)
 
 lint: bpf/vmlinux.h
 	cargo fmt --check
