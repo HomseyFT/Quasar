@@ -3,13 +3,13 @@
 //! The objects are compiled by build.rs and embedded in the binary, which is
 //! what lets a single static binary deploy to a host with no clang on it.
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
     maps::{MapData, PerCpuArray},
-    programs::{FEntry, TracePoint},
+    programs::{FEntry, Lsm, TracePoint},
     Btf, Ebpf, EbpfLoader, Endianness,
 };
 
@@ -95,6 +95,46 @@ pub fn attach_exec(ebpf: &mut Ebpf) -> Result<()> {
     program
         .attach("sched", "sched_process_exec")
         .context("attaching to sched:sched_process_exec")?;
+
+    Ok(())
+}
+
+/// Whether the kernel will accept a BPF LSM program.
+///
+/// `CONFIG_BPF_LSM=y` is not enough -- bpf also has to be in the active LSM
+/// list, which is fixed at boot from the kernel command line. Checking here
+/// turns "operation not supported" into a sentence that says what to do.
+pub fn lsm_available() -> bool {
+    fs::read_to_string("/sys/kernel/security/lsm")
+        .map(|list| list.split(',').any(|lsm| lsm.trim() == "bpf"))
+        .unwrap_or(false)
+}
+
+/// Attach the exec LSM hook.
+///
+/// Like fentry, an LSM program resolves its hook against the running kernel's
+/// BTF, which is a different thing from the `--btf` relocation override.
+pub fn attach_lsm(ebpf: &mut Ebpf) -> Result<()> {
+    if !lsm_available() {
+        anyhow::bail!(
+            "BPF LSM is not in the kernel's active list. Append ',bpf' to the \
+             lsm= parameter in the kernel command line and reboot; \
+             `grep bpf /sys/kernel/security/lsm` should then list it"
+        );
+    }
+
+    let btf = Btf::from_sys_fs().context("reading the running kernel's BTF")?;
+    let program: &mut Lsm = ebpf
+        .program_mut("quasar_bprm_check")
+        .context("no quasar_bprm_check program in the exec object")?
+        .try_into()?;
+
+    program
+        .load("bprm_check_security", &btf)
+        .context("the verifier rejected quasar_bprm_check")?;
+    program
+        .attach()
+        .context("attaching the LSM hook to bprm_check_security")?;
 
     Ok(())
 }

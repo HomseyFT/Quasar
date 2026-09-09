@@ -18,7 +18,7 @@ cd "$REPO" || exit 1
 
 BIN=${BIN:-./target/debug/quasar}
 PHASES=("$@")
-[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c 5)
+[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c 5 6a)
 
 [ "${QUASAR_TEST_ROOT:-}" = 1 ] || {
     echo "refusing to run without QUASAR_TEST_ROOT=1 -- this starts and removes containers" >&2
@@ -569,6 +569,83 @@ if want_phase 5; then
             && bad "an allowed exec still reached the client" \
             || ok "an allowed exec never reaches the client"
     }
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6a -- the LSM hook, reporting only.
+# ---------------------------------------------------------------------------
+if want_phase 6a; then
+    section 6a "the LSM hook reports without preventing"
+
+    if ! grep -q '\bbpf\b' /sys/kernel/security/lsm 2>/dev/null; then
+        bad "BPF LSM is not in the active list -- add ',bpf' to lsm= and reboot"
+        printf '        active: %s\n' "$(cat /sys/kernel/security/lsm 2>/dev/null)"
+    else
+        ok "BPF LSM is in the kernel's active list"
+
+        boot quasar-p6 alpine sleep 300
+
+        # A policy first, so there is something for an exec to fail to match.
+        start_quasar && {
+            docker exec quasar-p6 /bin/echo baseline >/dev/null 2>&1
+            sleep 2
+            stop_quasar
+        }
+        POLICY=$WORK/p6-policy
+        "$BIN" learn --from "$JSONL" --out "$POLICY" >/dev/null 2>&1
+
+        start_quasar --policy "$POLICY" --dry-run quasar-p6 && {
+            # The whole point: it is reported AND it runs.
+            OUT=$(docker exec quasar-p6 /bin/uname -a 2>&1)
+            docker exec quasar-p6 /bin/echo baseline >/dev/null 2>&1
+            sleep 2
+            stop_quasar
+
+            [ -n "$OUT" ] \
+                && ok "the exec still ran -- nothing was prevented" \
+                || bad "the exec produced no output; it may have been blocked"
+
+            assert_some "an unallowed exec is reported as would-block" \
+                'r["source"] == "quasar-p6" and r.get("path") == "/bin/uname" and r.get("outcome") == "would_block"'
+
+            # The control: what the policy allows is still silent, so the hook
+            # has not simply started reporting everything.
+            assert_none "an allowed exec stays silent" \
+                'r["source"] == "quasar-p6" and r.get("path") == "/bin/echo"'
+
+            # One exec, one event. The tracepoint and the LSM hook both see it,
+            # and reporting both would double every count and alert.
+            assert_count 1 "an armed exec is reported once, not twice" \
+                'r["source"] == "quasar-p6" and r.get("path") == "/bin/uname"'
+        }
+
+        # An unarmed container must report nothing about enforcement at all.
+        boot quasar-p6-unarmed alpine sleep 120
+        start_quasar --policy "$POLICY" --dry-run quasar-p6 && {
+            docker exec quasar-p6-unarmed /bin/uname -a >/dev/null 2>&1
+            sleep 2
+            stop_quasar
+
+            assert_none "an unarmed container is never reported as would-block" \
+                'r["source"] == "quasar-p6-unarmed" and r.get("outcome") == "would_block"'
+            assert_some "an unarmed container is still observed normally" \
+                'r["source"] == "quasar-p6-unarmed" and r.get("path") == "/bin/uname"'
+        }
+
+        # The lease. Killing quasar leaves the arming in the map with an expiry
+        # the kernel checks for itself, so it stops being honoured without
+        # anyone cleaning up. Proving it needs the map to outlive the process,
+        # which it does not -- so what is provable here is the other half: a
+        # fresh daemon that arms nothing reports nothing.
+        start_quasar --policy "$POLICY" && {
+            docker exec quasar-p6 /bin/uname -a >/dev/null 2>&1
+            sleep 2
+            stop_quasar
+
+            assert_none "arming does not survive into a daemon that did not ask for it" \
+                'r.get("outcome") == "would_block"'
+        }
+    fi
 fi
 
 # ---------------------------------------------------------------------------

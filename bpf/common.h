@@ -30,6 +30,17 @@ typedef uint64_t __u64;
 #define QUASAR_PROTO_TCP 6
 #define QUASAR_PROTO_UDP 17
 
+/* What happened to an exec. One event type covers all three so the log, the
+ * counters and the screen do not need parallel shapes for the same fact. */
+#define QUASAR_OUTCOME_OBSERVED    0  /* it ran, and nothing objected */
+#define QUASAR_OUTCOME_WOULD_BLOCK 1  /* dry run: enforcement would have stopped it */
+#define QUASAR_OUTCOME_BLOCKED     2  /* it was stopped (phase 6b) */
+
+/* Arming, per cgroup. */
+#define QUASAR_MODE_OFF     0
+#define QUASAR_MODE_DRY_RUN 1
+#define QUASAR_MODE_ENFORCE 2
+
 /* Field order is chosen so the struct packs with no interior padding and no
  * tail padding: 8-byte scalars, then 4-byte scalars, then the arrays. */
 struct exec_event {
@@ -40,7 +51,9 @@ struct exec_event {
 	__u32 ppid;
 	__u32 uid;
 	__u32 gid;
-	__u32 filename_len;   /* including the NUL; 0 if the read failed */
+	__u16 filename_len;   /* including the NUL; 0 if the read failed */
+	__u8  outcome;        /* QUASAR_OUTCOME_* */
+	__u8  _reserved;      /* named, so the struct still has no implicit hole */
 	__u8  comm[QUASAR_COMM_LEN];
 	__u8  filename[QUASAR_FILENAME_LEN];
 };
@@ -73,11 +86,20 @@ struct connect_event {
  * cgroup id changes each time it starts -- the maps are re-synced then.
  */
 
-#define QUASAR_HASH_LEN 16
-
+/* The path itself, not a digest of it.
+ *
+ * A hash only has to resist collisions while a collision means a missed
+ * detection. Once enforcement exists a collision means an attacker chose a
+ * file name that executes, so the class is removed rather than made difficult.
+ * The cost is 240 bytes per entry, which is nothing on this box.
+ *
+ * A path that fills the buffer was truncated, and a truncated path is not an
+ * identity. Both sides refuse those rather than storing a prefix that would
+ * match some other binary.
+ */
 struct exec_key {
 	__u64 cgroup_id;
-	__u8  path_hash[QUASAR_HASH_LEN];
+	__u8  path[QUASAR_FILENAME_LEN];
 };
 
 /* LPM_TRIE keys.
@@ -117,43 +139,18 @@ struct cidr_key6 {
 	struct cidr_data6 data;
 };
 
-/* ---- the path hash ------------------------------------------------------
+/* Arming state, per cgroup.
  *
- * The kernel and userspace must produce identical bytes or every lookup misses
- * and the filter silently becomes a no-op. This function is the one definition;
- * build.rs also compiles it for the host so a test can compare the two.
- *
- * Two FNV-1a passes with different offset bases give the 16 bytes SPEC.md
- * calls for without needing 128-bit arithmetic, which BPF does not have.
- *
- * FNV is not collision resistant. An attacker who chooses file names could
- * craft a path colliding with an allowed one; that only matters once phase 6
- * blocks on this, where a keyed hash would be the answer.
+ * The expiry is absolute and the probe compares it against bpf_ktime_get_ns
+ * itself. Userspace renews it on a heartbeat, so a userspace that dies -- or
+ * is killed -- cannot leave the kernel enforcing against nobody. The safe
+ * state is reached by doing nothing, which is the only kind of safe state
+ * worth having here.
  */
-
-#define QUASAR_FNV_PRIME   0x100000001b3ULL
-#define QUASAR_FNV_OFFSET1 0xcbf29ce484222325ULL
-#define QUASAR_FNV_OFFSET2 0x84222325cbf29ce4ULL
-
-static inline void quasar_path_hash(const __u8 *path, __u32 len, __u8 out[QUASAR_HASH_LEN])
-{
-	__u64 h1 = QUASAR_FNV_OFFSET1;
-	__u64 h2 = QUASAR_FNV_OFFSET2;
-	__u32 i;
-
-	if (len > QUASAR_FILENAME_LEN)
-		len = QUASAR_FILENAME_LEN;
-
-	for (i = 0; i < QUASAR_FILENAME_LEN; i++) {
-		if (i >= len)
-			break;
-		h1 = (h1 ^ path[i]) * QUASAR_FNV_PRIME;
-		h2 = (h2 ^ path[i]) * QUASAR_FNV_PRIME;
-		h2 = (h2 << 1) | (h2 >> 63); /* decorrelate the two passes */
-	}
-
-	__builtin_memcpy(out, &h1, sizeof(h1));
-	__builtin_memcpy(out + sizeof(h1), &h2, sizeof(h2));
-}
+struct enforce_state {
+	__u64 expires_at_ns;
+	__u8  mode;            /* QUASAR_MODE_* */
+	__u8  _reserved[7];
+};
 
 #endif /* QUASAR_COMMON_H */

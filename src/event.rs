@@ -16,11 +16,46 @@ mod sys {
 
 pub use sys::connect_event as ConnectEvent;
 pub use sys::exec_event as ExecEvent;
-pub use sys::{cidr_data, cidr_data6, cidr_key, cidr_key6, exec_key};
+pub use sys::{cidr_data, cidr_data6, cidr_key, cidr_key6, enforce_state, exec_key};
 pub use sys::{
     QUASAR_ADDR_LEN, QUASAR_AF_INET, QUASAR_AF_INET6, QUASAR_CGROUP_PREFIX_BITS, QUASAR_COMM_LEN,
-    QUASAR_FILENAME_LEN, QUASAR_HASH_LEN, QUASAR_PROTO_TCP, QUASAR_PROTO_UDP,
+    QUASAR_FILENAME_LEN, QUASAR_MODE_DRY_RUN, QUASAR_MODE_ENFORCE, QUASAR_MODE_OFF,
+    QUASAR_OUTCOME_BLOCKED, QUASAR_OUTCOME_OBSERVED, QUASAR_OUTCOME_WOULD_BLOCK, QUASAR_PROTO_TCP,
+    QUASAR_PROTO_UDP,
 };
+
+/// What happened to an exec. The probe reports all three on one event type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    #[default]
+    Observed,
+    WouldBlock,
+    Blocked,
+}
+
+impl Outcome {
+    /// Used to keep the common case out of the log: an exec that nothing
+    /// objected to says nothing about enforcement.
+    pub fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed)
+    }
+
+    fn from_raw(raw: u8) -> Self {
+        match u32::from(raw) {
+            QUASAR_OUTCOME_WOULD_BLOCK => Self::WouldBlock,
+            QUASAR_OUTCOME_BLOCKED => Self::Blocked,
+            // An outcome this build does not know is reported as an
+            // observation: the event is real either way, and inventing a
+            // severity for it would be worse than under-stating one.
+            _ => Self::Observed,
+        }
+    }
+
+    pub fn is_enforcement(self) -> bool {
+        matches!(self, Self::WouldBlock | Self::Blocked)
+    }
+}
 
 /// Decode one ring buffer record. Returns `None` if the record is too short to
 /// be the expected type, which would mean the probe and the loader disagree
@@ -44,6 +79,10 @@ impl ExecEvent {
 
     pub fn filename(&self) -> Cow<'_, str> {
         nul_terminated(&self.filename)
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        Outcome::from_raw(self.outcome)
     }
 }
 

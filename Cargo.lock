@@ -1953,7 +1953,6 @@ dependencies = [
  "aya-obj",
  "bindgen",
  "bollard",
- "cc",
  "clap",
  "crossterm",
  "env_logger",

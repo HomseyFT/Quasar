@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use quasar::{
+    event::Outcome,
     policy::Decision,
     sink::{
         record::{Attributed, Body, Record},
@@ -24,6 +25,7 @@ fn record(source: &str, path: &str) -> Record {
         comm: "sh".to_owned(),
         body: Body::Exec {
             path: path.to_owned(),
+            outcome: Outcome::Observed,
         },
     }
 }
@@ -62,7 +64,7 @@ fn paths(app: &App) -> Vec<String> {
     app.tail()
         .map(|entry| match entry {
             Entry::Event { record, .. } => match &record.body {
-                Body::Exec { path } => path.clone(),
+                Body::Exec { path, .. } => path.clone(),
                 Body::Connect { dest, .. } => dest.to_string(),
             },
             Entry::Gap { missed } => format!("gap:{missed}"),
@@ -121,7 +123,11 @@ fn the_newest_entries_are_what_fits_on_screen() {
     assert_eq!(visible.len(), 3);
     assert!(matches!(
         visible[2],
-        Entry::Event { record, .. } if record.body == Body::Exec { path: "/bin/19".to_owned() }
+        Entry::Event { record, .. }
+            if record.body == Body::Exec {
+                path: "/bin/19".to_owned(),
+                outcome: Outcome::Observed,
+            }
     ));
 }
 

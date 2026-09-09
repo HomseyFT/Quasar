@@ -8,6 +8,7 @@ use std::{
 };
 
 use quasar::{
+    event::Outcome,
     policy::Decision,
     sink::{
         record::{Attributed, Body, Record},
@@ -35,6 +36,7 @@ fn record(source: &str, path: &str) -> Record {
         comm: "sh".to_owned(),
         body: Body::Exec {
             path: path.to_owned(),
+            outcome: Outcome::Observed,
         },
     }
 }
@@ -131,7 +133,8 @@ async fn a_client_sees_events_and_an_immediate_snapshot() {
     assert_eq!(
         got.body,
         Body::Exec {
-            path: "/bin/sh".to_owned()
+            path: "/bin/sh".to_owned(),
+            outcome: Outcome::Observed
         }
     );
 
@@ -227,7 +230,8 @@ async fn a_dead_client_does_not_disturb_the_next_one() {
     assert_eq!(
         got.body,
         Body::Exec {
-            path: "/bin/after".to_owned()
+            path: "/bin/after".to_owned(),
+            outcome: Outcome::Observed
         }
     );
 

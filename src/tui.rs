@@ -22,6 +22,7 @@ use ratatui::{
 };
 
 use crate::{
+    event::Outcome,
     policy::Decision,
     sink::{
         record::{Body, Record},
@@ -51,6 +52,15 @@ pub fn severity(decision: Option<Decision>) -> Severity {
         Some(Decision::Denied) => Severity::Critical,
         Some(Decision::Unbaselined) => Severity::Warning,
         Some(Decision::Allowed) | None => Severity::Normal,
+    }
+}
+
+/// An exec enforcement objected to outranks whatever the policy alone said --
+/// a would-block is what enforcement will actually do to this container.
+pub fn severity_of(record: &Record, decision: Option<Decision>) -> Severity {
+    match &record.body {
+        Body::Exec { outcome, .. } if outcome.is_enforcement() => Severity::Critical,
+        _ => severity(decision),
     }
 }
 
@@ -345,7 +355,7 @@ fn render_entry(entry: &Entry) -> Line<'_> {
         )),
         Entry::Event { record, decision } => Line::from(Span::styled(
             describe(record),
-            match severity(*decision) {
+            match severity_of(record, *decision) {
                 Severity::Critical => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 Severity::Warning => Style::new().fg(Color::Yellow),
                 Severity::Normal => Style::new(),
@@ -356,7 +366,11 @@ fn render_entry(entry: &Entry) -> Line<'_> {
 
 pub fn describe(record: &Record) -> String {
     let what = match &record.body {
-        Body::Exec { path } => format!("exec {path}"),
+        Body::Exec { path, outcome } => match outcome {
+            Outcome::WouldBlock => format!("WOULD BLOCK exec {path}"),
+            Outcome::Blocked => format!("BLOCKED exec {path}"),
+            Outcome::Observed => format!("exec {path}"),
+        },
         Body::Connect { proto, dest, port } => format!("connect {proto} {dest}:{port}"),
     };
     format!(

@@ -35,7 +35,6 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 [build-dependencies]
 bindgen = "0.72"
-cc = "1"
 
 [dev-dependencies]
 aya-obj = "0.2"

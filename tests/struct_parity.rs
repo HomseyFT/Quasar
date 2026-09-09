@@ -10,8 +10,8 @@ use std::mem::{align_of, offset_of, size_of};
 
 use quasar::event::{
     cidr_data as CidrData, cidr_data6 as CidrData6, cidr_key as CidrKey, cidr_key6 as CidrKey6,
-    exec_key as ExecKey, ConnectEvent, ExecEvent, QUASAR_ADDR_LEN, QUASAR_CGROUP_PREFIX_BITS,
-    QUASAR_COMM_LEN, QUASAR_FILENAME_LEN, QUASAR_HASH_LEN,
+    enforce_state as EnforceState, exec_key as ExecKey, ConnectEvent, ExecEvent, QUASAR_ADDR_LEN,
+    QUASAR_CGROUP_PREFIX_BITS, QUASAR_COMM_LEN, QUASAR_FILENAME_LEN,
 };
 
 #[test]
@@ -27,6 +27,10 @@ fn exec_event_layout_is_pinned() {
     assert_eq!(offset_of!(ExecEvent, uid), 28);
     assert_eq!(offset_of!(ExecEvent, gid), 32);
     assert_eq!(offset_of!(ExecEvent, filename_len), 36);
+    // The outcome rides in space filename_len never needed: a path length
+    // cannot exceed 256, so 16 bits is plenty and the struct stays 312 bytes.
+    assert_eq!(offset_of!(ExecEvent, outcome), 38);
+    assert_eq!(offset_of!(ExecEvent, _reserved), 39);
     assert_eq!(offset_of!(ExecEvent, comm), 40);
     assert_eq!(offset_of!(ExecEvent, filename), 56);
 }
@@ -104,14 +108,31 @@ fn connect_event_has_no_padding() {
 
 #[test]
 fn exec_key_layout_is_pinned() {
-    assert_eq!(size_of::<ExecKey>(), 24, "exec_key size");
+    assert_eq!(size_of::<ExecKey>(), 264, "exec_key size");
     assert_eq!(align_of::<ExecKey>(), 8);
     assert_eq!(offset_of!(ExecKey, cgroup_id), 0);
-    assert_eq!(offset_of!(ExecKey, path_hash), 8);
+    assert_eq!(offset_of!(ExecKey, path), 8);
     assert_eq!(
         size_of::<ExecKey>(),
-        size_of::<u64>() + QUASAR_HASH_LEN as usize,
+        size_of::<u64>() + QUASAR_FILENAME_LEN as usize,
         "exec_key must have no padding: it is compared byte for byte"
+    );
+}
+
+/// The kernel reads this while deciding whether to honour an arming, so a
+/// disagreement about its shape means arming that never expires -- or never
+/// takes effect.
+#[test]
+fn enforce_state_layout_is_pinned() {
+    assert_eq!(size_of::<EnforceState>(), 16, "enforce_state size");
+    assert_eq!(align_of::<EnforceState>(), 8);
+    assert_eq!(offset_of!(EnforceState, expires_at_ns), 0);
+    assert_eq!(offset_of!(EnforceState, mode), 8);
+    assert_eq!(offset_of!(EnforceState, _reserved), 9);
+    assert_eq!(
+        size_of::<EnforceState>(),
+        size_of::<u64>() + 1 + 7,
+        "enforce_state must have no implicit padding"
     );
 }
 

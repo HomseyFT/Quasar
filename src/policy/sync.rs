@@ -28,36 +28,24 @@ unsafe impl Pod for exec_key {}
 unsafe impl Pod for cidr_data {}
 unsafe impl Pod for cidr_data6 {}
 
-const FNV_PRIME: u64 = 0x100000001b3;
-const FNV_OFFSET1: u64 = 0xcbf29ce484222325;
-const FNV_OFFSET2: u64 = 0x84222325cbf29ce4;
-
-/// Hash a path exactly as the probe does.
+/// The allowlist key for a path, or `None` if the path cannot be one.
 ///
-/// The probe hashes what `bpf_probe_read_kernel_str` returned, and that length
-/// *includes* the NUL terminator -- so the terminator is part of the hash. Miss
-/// that and every lookup silently misses. `tests/hash_parity.rs` compares this
-/// against the C directly rather than trusting the description.
-pub fn path_hash(path: &str) -> [u8; 16] {
-    let mut bytes = path.as_bytes().to_vec();
-    bytes.push(0);
-    hash_bytes(&bytes)
-}
-
-pub fn hash_bytes(bytes: &[u8]) -> [u8; 16] {
-    let mut h1 = FNV_OFFSET1;
-    let mut h2 = FNV_OFFSET2;
-
-    for &byte in bytes.iter().take(QUASAR_FILENAME_LEN as usize) {
-        h1 = (h1 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-        h2 = (h2 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-        h2 = h2.rotate_left(1);
+/// The probe reads the path with `bpf_probe_read_kernel_str` into a buffer of
+/// exactly this size, so what it looks up is the path plus its NUL. A path
+/// that would not fit is refused here rather than truncated: a prefix could
+/// name a different binary, and under enforcement that is an execution.
+pub fn exec_key_for(cgroup_id: u64, path: &str) -> Option<exec_key> {
+    let bytes = path.as_bytes();
+    if bytes.len() + 1 > QUASAR_FILENAME_LEN as usize {
+        return None;
     }
 
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&h1.to_ne_bytes());
-    out[8..].copy_from_slice(&h2.to_ne_bytes());
-    out
+    let mut key = exec_key {
+        cgroup_id,
+        path: [0; QUASAR_FILENAME_LEN as usize],
+    };
+    key.path[..bytes.len()].copy_from_slice(bytes);
+    Some(key)
 }
 
 pub struct MapSync {
@@ -125,10 +113,8 @@ impl MapSync {
     }
 
     fn allow_exec(&mut self, cgroup_id: u64, rule: &ExecRule) -> Result<()> {
-        let key = exec_key {
-            cgroup_id,
-            path_hash: path_hash(&rule.path),
-        };
+        let key = exec_key_for(cgroup_id, &rule.path)
+            .with_context(|| format!("{} does not fit an allowlist key", rule.path))?;
         self.exec_allow.insert(key, 1, 0)?;
         Ok(())
     }
@@ -159,11 +145,9 @@ impl MapSync {
     /// reused id must not inherit the previous container's allowlist.
     pub fn clear(&mut self, cgroup_id: u64, policy: &Policy) {
         for rule in &policy.exec.allow {
-            let key = exec_key {
-                cgroup_id,
-                path_hash: path_hash(&rule.path),
-            };
-            let _ = self.exec_allow.remove(&key);
+            if let Some(key) = exec_key_for(cgroup_id, &rule.path) {
+                let _ = self.exec_allow.remove(&key);
+            }
         }
 
         for rule in &policy.egress.allow {

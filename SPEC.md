@@ -104,7 +104,9 @@ bpf/
   common.h             shared event structs — must match src/event.rs exactly
   exec.bpf.c           tracepoint sched/sched_process_exec
   connect.bpf.c        fentry tcp_v4_connect, tcp_v6_connect, udp_sendmsg
-  lsm.bpf.c            bpf_lsm_bprm_check_security          (phase 6)
+                       (bpf_lsm_bprm_check_security lives in exec.bpf.c:
+                        it shares every map with the tracepoint, and sharing
+                        maps across objects would mean pinning into bpffs)
 
 src/
   main.rs              CLI: run | top | learn | enforce | policy
@@ -333,6 +335,27 @@ lsm=lockdown,capability,landlock,yama,apparmor,bpf
 ```
 
 then `update-grub` and reboot. Verify with `grep bpf /sys/kernel/security/lsm`.
+
+Split into **6a**, the hook reporting only, and **6b**, enforcement. 6a contains
+no code path that returns `-EPERM`, so no bug in arming, expiry or the allowlist
+can stop a process from running; the worst case is a log line. That is also what
+the spec already asks for by requiring a dry run first.
+
+**The allowlist key stops being a hash.** `exec_key` carries the path itself.
+FNV only had to resist collisions while a collision meant a missed detection;
+once a match means permission to execute, a collision is an attacker choosing a
+file name. Storing the path removes the class rather than making it difficult,
+and it deletes the two-language hash and its parity test. A path that does not
+fit the key is refused at both ends rather than truncated, because a prefix can
+name a different binary.
+
+**Arming is a lease, not a switch.** Each armed cgroup carries an absolute
+expiry that the probe compares against `bpf_ktime_get_ns` itself, and userspace
+renews it on a heartbeat. Enforcement is therefore something that must be
+actively maintained rather than actively cleaned up: kill quasar and the kernel
+stops honouring the arming within a lease, with no cooperation from the process
+that is no longer running. The dry run proves that machinery while the failure
+mode is still only "we stop logging".
 
 Attach `bpf_lsm_bprm_check_security`, return `-EPERM` for a disallowed exec.
 Two mandatory safety rails:

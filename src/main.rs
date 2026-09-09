@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +12,7 @@ use anyhow::{Context, Result};
 use aya::maps::RingBuf;
 use clap::{Args, Parser, Subcommand};
 use quasar::{
+    enforce::{Armory, RENEW},
     event::{ConnectEvent, Event, ExecEvent},
     loader::{self, DropCounter},
     policy::{
@@ -149,6 +151,11 @@ struct RunArgs {
     #[arg(long, value_name = "URL")]
     ntfy: Option<String>,
 
+    /// Arm this container for a dry run: an exec its policy does not allow is
+    /// reported as WOULD BLOCK, and nothing is ever prevented. Repeatable.
+    #[arg(long = "dry-run", value_name = "CONTAINER")]
+    dry_run: Vec<String>,
+
     /// Serve a live event tail and counters on this unix socket for
     /// `quasar top`. Without it the daemon has no socket at all.
     #[arg(long, value_name = "PATH")]
@@ -191,6 +198,14 @@ async fn run(args: &RunArgs) -> Result<()> {
     });
     let mut sync = MapSync::take(&mut exec_ebpf, &mut connect_ebpf)?;
 
+    // The LSM hook is attached only when something asked for it, so a kernel
+    // without BPF LSM runs everything else exactly as before.
+    let requested: BTreeSet<String> = args.dry_run.iter().cloned().collect();
+    let mut armory = Armory::take(&mut exec_ebpf, requested)?;
+    if armory.requested().next().is_some() {
+        loader::attach_lsm(&mut exec_ebpf)?;
+    }
+
     let exec_kernel_drops = DropCounter::take(&mut exec_ebpf, "exec")?;
     let connect_kernel_drops = DropCounter::take(&mut connect_ebpf, "connect")?;
 
@@ -211,6 +226,7 @@ async fn run(args: &RunArgs) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Event>(EVENT_QUEUE_DEPTH);
 
     sync_all(&mut sync, &policies, &registry).await;
+    arm_all(&mut armory, &registry).await;
 
     let (changes_tx, mut changes_rx) = mpsc::channel::<ContainerChange>(64);
 
@@ -219,20 +235,47 @@ async fn run(args: &RunArgs) -> Result<()> {
     let resync = tokio::spawn({
         let policies = Arc::clone(&policies);
         async move {
-            while let Some(change) = changes_rx.recv().await {
-                match change {
-                    ContainerChange::Started { name, cgroup_id } => {
-                        if let Some(policy) = policies.by_container.get(&name) {
-                            let applied = sync.apply(cgroup_id, policy);
-                            eprintln!(
-                                "quasar: {name} started, {} exec and {} egress rules applied",
-                                applied.exec, applied.egress
-                            );
+            // The same task renews the arming leases, because it owns the
+            // arming map. A lease that stops being renewed expires, and the
+            // kernel stops honouring the arming on its own.
+            let mut heartbeat = tokio::time::interval(RENEW);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    change = changes_rx.recv() => {
+                        let Some(change) = change else { break };
+                        match change {
+                            ContainerChange::Started { name, cgroup_id } => {
+                                if let Some(policy) = policies.by_container.get(&name) {
+                                    let applied = sync.apply(cgroup_id, policy);
+                                    eprintln!(
+                                        "quasar: {name} started, {} exec and {} egress rules applied",
+                                        applied.exec, applied.egress
+                                    );
+                                }
+                                // Arming is keyed on a cgroup id that changed.
+                                match armory.arm(&name, cgroup_id) {
+                                    Ok(true) => eprintln!("quasar: {name} armed for a dry run"),
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        eprintln!("quasar: arming {name} failed: {error:#}");
+                                    }
+                                }
+                            }
+                            ContainerChange::Stopped { name, cgroup_id } => {
+                                if let Some(policy) = policies.by_container.get(&name) {
+                                    sync.clear(cgroup_id, policy);
+                                }
+                                if let Err(error) = armory.disarm(&name) {
+                                    eprintln!("quasar: disarming {name} failed: {error:#}");
+                                }
+                            }
                         }
                     }
-                    ContainerChange::Stopped { name, cgroup_id } => {
-                        if let Some(policy) = policies.by_container.get(&name) {
-                            sync.clear(cgroup_id, policy);
+                    _ = heartbeat.tick() => {
+                        if let Err(error) = armory.renew() {
+                            eprintln!("quasar: renewing the arming leases failed: {error:#}");
                         }
                     }
                 }
@@ -487,6 +530,32 @@ fn report_losses(queue_drops: u64, exec: &DropCounter, connect: &DropCounter) {
 
 /// Push every loaded policy down under the cgroup id its container is running
 /// as right now. A container with no policy is simply not filtered.
+/// Arm whatever was asked for and is already running.
+///
+/// Nothing is armed for a container that is not running: arming is keyed on a
+/// cgroup id, and one that does not exist yet is not a thing to guess at. The
+/// container is armed when the registry reports it starting.
+async fn arm_all(armory: &mut Armory, registry: &Registry) {
+    if armory.requested().next().is_none() {
+        return;
+    }
+
+    for (name, cgroup_id) in registry.running_containers().await {
+        if let Err(error) = armory.arm(&name, cgroup_id) {
+            eprintln!("quasar: arming {name} failed: {error:#}");
+        }
+    }
+
+    let waiting: Vec<&String> = armory.requested().collect();
+    eprintln!(
+        "quasar: dry run armed for {} of {} requested containers ({:?} requested)",
+        armory.armed_count(),
+        waiting.len(),
+        waiting
+    );
+    eprintln!("quasar: nothing will be prevented -- this phase only reports");
+}
+
 async fn sync_all(sync: &mut MapSync, policies: &PolicySet, registry: &Registry) {
     if policies.by_container.is_empty() {
         return;

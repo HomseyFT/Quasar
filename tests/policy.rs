@@ -352,3 +352,54 @@ fn unbaselined_egress_alerts_and_allowed_egress_does_not() {
         Some(Decision::Unbaselined)
     );
 }
+
+// -- the allowlist key ------------------------------------------------------
+//
+// The probe reads the path into a buffer of exactly this size and looks the
+// result up byte for byte. A key built differently here never matches, which
+// under observation means the filter does nothing and under enforcement means
+// everything is blocked.
+
+use quasar::{event::QUASAR_FILENAME_LEN, policy::sync::exec_key_for};
+
+#[test]
+fn a_key_is_the_path_then_nul_then_zeros() {
+    let key = exec_key_for(7, "/bin/sh").expect("a short path fits");
+
+    assert_eq!(key.cgroup_id, 7);
+    assert_eq!(&key.path[..7], b"/bin/sh");
+    assert_eq!(
+        key.path[7], 0,
+        "the probe hashes nothing -- it reads a string"
+    );
+    assert!(
+        key.path[8..].iter().all(|&b| b == 0),
+        "the tail must be zeroed or the same path yields two different keys"
+    );
+}
+
+#[test]
+fn the_longest_path_that_fits_still_fits() {
+    let longest = "/".repeat(QUASAR_FILENAME_LEN as usize - 1);
+    let key = exec_key_for(1, &longest).expect("255 bytes plus a NUL is exactly the buffer");
+
+    assert_eq!(key.path[QUASAR_FILENAME_LEN as usize - 1], 0);
+}
+
+/// A truncated path is a prefix, and a prefix can name a different binary.
+/// Refusing is the only safe answer once a match means permission to execute.
+#[test]
+fn a_path_too_long_for_the_key_is_refused_not_truncated() {
+    let too_long = "/".repeat(QUASAR_FILENAME_LEN as usize);
+
+    assert!(exec_key_for(1, &too_long).is_none());
+    assert!(exec_key_for(1, &"x".repeat(4096)).is_none());
+}
+
+#[test]
+fn different_containers_never_share_a_key() {
+    assert_ne!(
+        exec_key_for(1, "/bin/sh").expect("key").cgroup_id,
+        exec_key_for(2, "/bin/sh").expect("key").cgroup_id
+    );
+}

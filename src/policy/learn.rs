@@ -87,7 +87,7 @@ pub fn observe(log: &Path) -> Result<Observations> {
             .or_default();
 
         match record.body {
-            Body::Exec { path } => {
+            Body::Exec { path, .. } => {
                 if !is_stable_path(&path) {
                     observations.unstable_paths += 1;
                     continue;

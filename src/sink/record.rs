@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event::{ConnectEvent, ExecEvent},
+    event::{ConnectEvent, ExecEvent, Outcome},
     registry::Attribution,
 };
 
@@ -46,6 +46,10 @@ impl From<&Attribution> for Attributed {
 pub enum Body {
     Exec {
         path: String,
+        /// Absent for an ordinary observation, so the common line stays quiet
+        /// and logs written before enforcement existed still parse.
+        #[serde(default, skip_serializing_if = "Outcome::is_observed")]
+        outcome: Outcome,
     },
     Connect {
         proto: String,
@@ -99,6 +103,7 @@ impl Clock {
             comm: event.comm().into_owned(),
             body: Body::Exec {
                 path: event.filename().into_owned(),
+                outcome: event.outcome(),
             },
         }
     }
@@ -127,6 +132,12 @@ impl Clock {
             .map(|t| t.to_string())
             .unwrap_or_else(|_| format!("+{monotonic_ns}ns"))
     }
+}
+
+/// The clock the probes stamp events with, and the one arming expiries are
+/// expressed in. Kept here because this is where clock reading lives.
+pub fn monotonic_ns() -> Result<u64> {
+    Ok(clock_ns(libc::CLOCK_MONOTONIC)?.max(0) as u64)
 }
 
 fn clock_ns(clock: libc::clockid_t) -> Result<i128> {
