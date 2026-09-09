@@ -35,8 +35,13 @@ pub struct ContainerObservations {
 /// policy can usefully permit.
 ///
 /// These are still logged and still evaluated; they are just not baselined.
+use super::is_baselineable;
+
+/// Kept as a named wrapper because the count it drives is reported to the
+/// operator: a large number here means the policy is being learned from paths
+/// that will not be there next time.
 fn is_stable_path(path: &str) -> bool {
-    !path.starts_with("/proc/")
+    is_baselineable(path)
 }
 
 #[derive(Debug, Default)]

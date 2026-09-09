@@ -47,9 +47,15 @@ Three consequences that shape everything:
 build produces one statically linked musl binary carrying the BPF objects
 embedded. Nothing is compiled on the server.
 
-**7.7 GB across 25 containers means overhead is a budget.** `pihole` alone
-generates thousands of `udp_sendmsg` calls per second. Filtering has to happen
-in the kernel, not in userspace.
+**7.7 GB across 25 containers means overhead is a budget.** This originally
+read "`pihole` alone generates thousands of `udp_sendmsg` calls per second",
+which was an estimate nobody had checked against the box. Measured: the whole
+host produces about 18 events/s unfiltered, 85% of them `cloudflared`, and
+quasar costs 0.015% of the host against a 2% budget (`scripts/soak.sh`).
+
+The conclusion still holds -- filtering belongs in the kernel, and the policy
+still has to collapse `cloudflared`'s traffic to one rule -- but the per-cgroup
+rate limiter the budget seemed to demand is not needed and is not being built.
 
 **BPF LSM needs a reboot.** Enforcement is blocked on appending `,bpf` to the
 kernel cmdline and rebooting the server. Plan it; do not discover it in phase 5.
@@ -258,6 +264,27 @@ stays under 2% CPU with pihole running.
 
 The policy model, the map sync, `quasar learn`, JSONL output, ntfy alerts.
 Kernel-side filtering lands here, which is also what makes the volume tractable.
+
+Alerts collapse. Repeats of the same `(container, decision, subject)` become one
+notification per window with a count, and a burst that stops is summarised when
+its window closes. One notification per event would send thousands on the first
+day of a wrong policy and train its reader to swipe them away.
+
+**Container init is exempt from alerting and never baselined.** runc copies
+itself into a memfd and execs the descriptor, so container init arrives as
+`/proc/self/fd/N` with a comm of `N`, on every `docker exec` rather than only at
+container start. It cannot be baselined: the number is a file descriptor slot,
+not an identity, so allowing it would allow every future exec through that slot.
+Resolving it does not help either -- `/proc/<pid>/exe` reads back as
+`/memfd:runc_cloned:/proc/self/exe (deleted)`, a label any process can forge in
+twenty lines. So the exemption silences the alert and nothing else: the event is
+still logged, and `learn` still refuses the path.
+
+That accepts a real gap -- an attacker exec'ing through their own
+`/proc/self/fd/N` raises nothing. The signal that would actually hold is the
+parent's cgroup: runc runs on the host, and a process inside a container cannot
+give itself a parent outside its own cgroup. That is what phase 6 should enforce
+on, and it needs verifying against live data before it is built on.
 
 **Accepts when:** a week of `learn` produces policy files for all 25 containers
 that you can read and correct; after loading them, a normal day produces zero

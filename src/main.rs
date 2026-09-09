@@ -1,6 +1,10 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -15,13 +19,20 @@ use quasar::{
         PolicySet,
     },
     registry::{Attribution, ContainerChange, Registry},
-    sink::jsonl::JsonlSink,
+    sink::{
+        jsonl::JsonlSink,
+        ntfy::{self, Admit, Alert, AlertKey, NtfySink, Suppressor},
+    },
 };
-use tokio::{io::unix::AsyncFd, sync::mpsc};
+use tokio::{io::unix::AsyncFd, sync::mpsc, time::MissedTickBehavior};
 
 /// Bounded so a container in a crash-loop cannot grow the queue without limit.
 /// Overflow is counted and reported rather than allowed to stall the drain.
 const EVENT_QUEUE_DEPTH: usize = 4096;
+
+/// Small on purpose. Suppression means a healthy system produces a trickle, so
+/// a full queue means ntfy is unreachable and the backlog is already stale.
+const ALERT_QUEUE_DEPTH: usize = 256;
 
 #[derive(Parser)]
 #[command(name = "quasar", version, about = "eBPF container security monitor")]
@@ -107,6 +118,11 @@ struct RunArgs {
     #[arg(long, value_name = "DIR")]
     policy: Option<PathBuf>,
 
+    /// Push an alert to this ntfy topic URL for anything denied or
+    /// unbaselined. Without it quasar observes and logs but never notifies.
+    #[arg(long, value_name = "URL")]
+    ntfy: Option<String>,
+
     /// Do not print events. The JSONL log and every diagnostic on stderr are
     /// unaffected. stdout is line buffered, so a syscall per event is real
     /// cost at pihole's rates -- an unattended run should not pay it.
@@ -138,10 +154,10 @@ async fn run(args: &RunArgs) -> Result<()> {
 
     // Policy goes down before the ring buffers are drained, so a known-good
     // event is already being filtered by the time the first one could arrive.
-    let policies = match policy_dir {
+    let policies = Arc::new(match policy_dir {
         Some(dir) => PolicySet::load_dir(dir)?,
         None => PolicySet::default(),
-    };
+    });
     let mut sync = MapSync::take(&mut exec_ebpf, &mut connect_ebpf)?;
 
     let exec_kernel_drops = DropCounter::take(&mut exec_ebpf, "exec")?;
@@ -170,7 +186,7 @@ async fn run(args: &RunArgs) -> Result<()> {
     // A container's cgroup id changes every time it starts, so its allowlist
     // has to be rewritten under the new id or nothing matches.
     let resync = tokio::spawn({
-        let policies = policies.clone();
+        let policies = Arc::clone(&policies);
         async move {
             while let Some(change) = changes_rx.recv().await {
                 match change {
@@ -195,11 +211,28 @@ async fn run(args: &RunArgs) -> Result<()> {
 
     let mut sink = jsonl.map(JsonlSink::create).transpose()?;
 
+    let alert_drops = Arc::new(AtomicU64::new(0));
+    let alerts = spawn_alerter(args.ntfy.as_deref(), Arc::clone(&alert_drops))?;
+
     let consumer = tokio::spawn({
         let registry = Arc::clone(&registry);
+        let policies = Arc::clone(&policies);
+        let alert_drops = Arc::clone(&alert_drops);
         async move {
             while let Some(event) = rx.recv().await {
                 let who = registry.resolve(event.cgroup_id(), event.pid()).await;
+
+                if let Some(tx) = &alerts {
+                    if let Some(alert) = alert_for(&policies, &who, &event) {
+                        // An alert that cannot be queued is dropped rather than
+                        // allowed to stall event processing, and counted so the
+                        // loss is not silent.
+                        if tx.try_send(alert).is_err() {
+                            alert_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 let logged = match &event {
                     Event::Exec(e) => sink.as_mut().map(|s| s.write_exec(&who, e)),
                     Event::Connect(e) => sink.as_mut().map(|s| s.write_connect(&who, e)),
@@ -258,8 +291,107 @@ async fn run(args: &RunArgs) -> Result<()> {
     resync.abort();
 
     report_losses(dropped, &exec_kernel_drops, &connect_kernel_drops);
+    let missed = alert_drops.load(Ordering::Relaxed);
+    if missed > 0 {
+        eprintln!("quasar: {missed} alerts were never sent, ntfy could not keep up");
+    }
     eprintln!("quasar: detaching");
     Ok(())
+}
+
+/// The alert path, kept off the consumer: a POST to an unreachable ntfy blocks
+/// for its whole timeout, and event processing must not wait on that.
+fn spawn_alerter(url: Option<&str>, drops: Arc<AtomicU64>) -> Result<Option<mpsc::Sender<Alert>>> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+
+    let sink = NtfySink::new(url)?;
+    let (tx, mut rx) = mpsc::channel::<Alert>(ALERT_QUEUE_DEPTH);
+
+    tokio::spawn(async move {
+        let mut suppressor = Suppressor::new(ntfy::DEFAULT_WINDOW);
+        let mut sweep = tokio::time::interval_at(
+            tokio::time::Instant::now() + ntfy::DEFAULT_WINDOW,
+            ntfy::DEFAULT_WINDOW,
+        );
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                received = rx.recv() => {
+                    let Some(alert) = received else { break };
+                    if let Admit::Send { suppressed } =
+                        suppressor.admit(&alert.key, Instant::now())
+                    {
+                        push(&sink, &alert.render(suppressed), &drops).await;
+                    }
+                }
+                _ = sweep.tick() => {
+                    // Tell someone about the tail of a burst that stopped.
+                    // Without this an alert fires once and the ten thousand
+                    // behind it are never mentioned.
+                    for (key, suppressed) in suppressor.expired(Instant::now()) {
+                        push(&sink, &ntfy::render(&key, "", suppressed), &drops).await;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Some(tx))
+}
+
+async fn push(sink: &NtfySink, message: &ntfy::Message, drops: &AtomicU64) {
+    if let Err(error) = sink.send(message).await {
+        drops.fetch_add(1, Ordering::Relaxed);
+        eprintln!("quasar: alert not delivered: {error:#}");
+    }
+}
+
+/// The alert an event deserves, or `None` for silence.
+///
+/// Only a named container can be matched to a policy file, so an event from an
+/// unnamed one, from the host, or from a container with no policy is logged and
+/// nothing more.
+fn alert_for(policies: &PolicySet, who: &Attribution, event: &Event) -> Option<Alert> {
+    let Attribution::Named { name, .. } = who else {
+        return None;
+    };
+
+    let (decision, subject, detail) = match event {
+        Event::Exec(e) => {
+            let path = e.filename().into_owned();
+            (
+                policies.exec_alert(name, &path)?,
+                format!("exec {path}"),
+                detail(e.pid, e.ppid, e.uid, &e.comm()),
+            )
+        }
+        Event::Connect(e) => (
+            policies.egress_alert(name, e.destination())?,
+            format!(
+                "connect {} {}:{}",
+                e.protocol_name(),
+                e.destination(),
+                e.dport
+            ),
+            detail(e.pid, e.ppid, e.uid, &e.comm()),
+        ),
+    };
+
+    Some(Alert {
+        key: AlertKey {
+            container: name.clone(),
+            decision,
+            subject,
+        },
+        detail,
+    })
+}
+
+fn detail(pid: u32, ppid: u32, uid: u32, comm: &str) -> String {
+    format!("pid {pid} ppid {ppid} uid {uid} comm {comm}")
 }
 
 /// Two different losses with two different fixes, so they are never summed.

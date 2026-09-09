@@ -102,13 +102,47 @@ pub struct Policy {
 }
 
 /// What the policy says about one observation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Decision {
     Allowed,
     /// Matched a deny rule. Deny always beats allow.
     Denied,
     /// No rule matched. This is what an alert is made of.
     Unbaselined,
+}
+
+/// Whether a decision is worth waking someone for.
+pub fn alertable(decision: Decision) -> bool {
+    matches!(decision, Decision::Denied | Decision::Unbaselined)
+}
+
+/// runc copies itself into a memfd and execs the descriptor, so container init
+/// arrives as `/proc/self/fd/7` with a comm of `7`.
+///
+/// These are exempt from alerting and nothing more. They are still logged, and
+/// they are never baselined: the number is a file descriptor slot, not an
+/// identity, and anything in the container can point it at anything it likes.
+/// Allowing it would allow every future exec through that slot. Resolving it
+/// does not help either -- `/proc/<pid>/exe` reads back as a memfd label that
+/// is just as forgeable. The signal that would actually hold is the parent's
+/// cgroup, which a process inside the container cannot fake, and that is what
+/// enforcement should use.
+/// Whether a path is a durable enough identity to put in a policy file.
+///
+/// Everything under `/proc` names a runtime artifact rather than a binary --
+/// a file descriptor slot, a pid, a memfd -- and every one of them is chosen
+/// by the process being observed. Baselining any of them would allow whatever
+/// that name happens to point at next time.
+///
+/// This is enforced in `learn_exec` rather than only in the `learn` command, so
+/// no future caller can baseline one by accident.
+pub fn is_baselineable(path: &str) -> bool {
+    !path.starts_with("/proc/")
+}
+
+pub fn is_runtime_reexec(path: &str) -> bool {
+    path.strip_prefix("/proc/self/fd/")
+        .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl Policy {
@@ -148,7 +182,7 @@ impl Policy {
     /// is what keeps a manual entry -- allow *or* deny -- authoritative. A path
     /// a human deliberately denied is not quietly re-allowed by the next run.
     pub fn learn_exec(&mut self, path: &str) -> bool {
-        if self.check_exec(path) != Decision::Unbaselined {
+        if !is_baselineable(path) || self.check_exec(path) != Decision::Unbaselined {
             return false;
         }
         self.exec.allow.push(ExecRule {
@@ -218,6 +252,24 @@ pub struct PolicySet {
 }
 
 impl PolicySet {
+    /// The decision to alert on for an exec, or `None` for silence.
+    ///
+    /// A container with no policy file is observed, never alerted on -- the
+    /// same reason a bad policy must not block startup. An unnamed container
+    /// cannot be matched to a file at all, so it is silent too.
+    pub fn exec_alert(&self, container: &str, path: &str) -> Option<Decision> {
+        if is_runtime_reexec(path) {
+            return None;
+        }
+        let decision = self.by_container.get(container)?.check_exec(path);
+        alertable(decision).then_some(decision)
+    }
+
+    pub fn egress_alert(&self, container: &str, addr: IpAddr) -> Option<Decision> {
+        let decision = self.by_container.get(container)?.check_egress(addr);
+        alertable(decision).then_some(decision)
+    }
+
     /// Load every `*.toml` in a directory. A missing directory is an empty set,
     /// not an error: the service must start cleanly with no policy at all, so a
     /// bad or absent policy file can never prevent startup.

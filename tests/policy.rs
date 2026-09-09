@@ -234,3 +234,121 @@ fn unstable_proc_paths_are_not_baselined() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// -- what gets alerted on ---------------------------------------------------
+
+fn policy_set(container: &str, policy: Policy) -> PolicySet {
+    let mut set = PolicySet::default();
+    set.by_container.insert(container.to_owned(), policy);
+    set
+}
+
+fn allowing(path: &str) -> Policy {
+    let mut policy = Policy::default();
+    policy.exec.allow.push(ExecRule {
+        path: path.to_owned(),
+        source: Source::Learned,
+        note: None,
+    });
+    policy
+}
+
+#[test]
+fn an_unbaselined_exec_alerts() {
+    let set = policy_set("api", allowing("/bin/sh"));
+
+    assert_eq!(
+        set.exec_alert("api", "/bin/nc"),
+        Some(Decision::Unbaselined)
+    );
+}
+
+#[test]
+fn a_denied_exec_alerts() {
+    let mut policy = allowing("/bin/sh");
+    policy.exec.deny.push(manual_exec("/bin/nc"));
+
+    assert_eq!(
+        policy_set("api", policy).exec_alert("api", "/bin/nc"),
+        Some(Decision::Denied)
+    );
+}
+
+#[test]
+fn an_allowed_exec_is_silent() {
+    let set = policy_set("api", allowing("/bin/sh"));
+
+    assert_eq!(set.exec_alert("api", "/bin/sh"), None);
+}
+
+/// The service must start cleanly with no policy at all. A container nobody has
+/// baselined yet is observed and logged, never alerted on -- otherwise adding a
+/// container to the host pages whoever is on call.
+#[test]
+fn a_container_with_no_policy_never_alerts() {
+    let set = policy_set("api", allowing("/bin/sh"));
+
+    assert_eq!(set.exec_alert("unknown-container", "/bin/nc"), None);
+    assert_eq!(set.egress_alert("unknown-container", addr("9.9.9.9")), None);
+}
+
+/// runc copies itself into a memfd and execs the descriptor, so container init
+/// shows up as /proc/self/fd/N on every `docker exec`. Alerting on it would
+/// make every container start a false positive.
+#[test]
+fn the_runtime_reexec_does_not_alert() {
+    let set = policy_set("api", allowing("/bin/sh"));
+
+    assert_eq!(set.exec_alert("api", "/proc/self/fd/6"), None);
+    assert_eq!(set.exec_alert("api", "/proc/self/fd/14"), None);
+}
+
+/// The exemption is exactly `/proc/self/fd/<digits>`. Anything else under
+/// /proc is a path an attacker chose, and stays loud.
+#[test]
+fn other_proc_paths_still_alert() {
+    let set = policy_set("api", allowing("/bin/sh"));
+
+    for path in [
+        "/proc/self/fd/6/../../../bin/nc",
+        "/proc/self/fdx/6",
+        "/proc/self/fd/",
+        "/proc/self/fd/6a",
+        "/proc/1234/fd/6",
+        "/proc/self/exe",
+    ] {
+        assert_eq!(
+            set.exec_alert("api", path),
+            Some(Decision::Unbaselined),
+            "{path} should still alert"
+        );
+    }
+}
+
+/// Exempt from *alerting* only. It must never become an allow rule: the fd
+/// number is a slot an attacker controls, so allowing it would allow every
+/// future exec through that slot.
+#[test]
+fn the_runtime_reexec_is_still_not_baselined() {
+    let mut policy = Policy::default();
+
+    assert!(!policy.learn_exec("/proc/self/fd/6"));
+    assert!(policy.exec.allow.is_empty());
+}
+
+#[test]
+fn unbaselined_egress_alerts_and_allowed_egress_does_not() {
+    let mut policy = Policy::default();
+    policy.egress.allow.push(EgressRule {
+        cidr: "10.0.0.0/8".parse().expect("test cidr"),
+        source: Source::Manual,
+        note: None,
+    });
+    let set = policy_set("api", policy);
+
+    assert_eq!(set.egress_alert("api", addr("10.1.2.3")), None);
+    assert_eq!(
+        set.egress_alert("api", addr("9.9.9.9")),
+        Some(Decision::Unbaselined)
+    );
+}
