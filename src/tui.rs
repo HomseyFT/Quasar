@@ -7,8 +7,11 @@
 
 use std::{collections::VecDeque, path::Path, time::Duration};
 
-use anyhow::Result;
-use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind};
+use anyhow::{bail, Context, Result};
+use crossterm::{
+    event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind},
+    tty::IsTty,
+};
 use futures_util::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout},
@@ -147,12 +150,19 @@ fn volume(counts: &Counts) -> u64 {
 }
 
 pub async fn run(path: &Path) -> Result<()> {
+    // Checked before anything else: initialising a terminal that is not there
+    // panics deep inside ratatui, and a redirected `quasar top` deserves a
+    // sentence telling it what to do instead.
+    if !std::io::stdout().is_tty() {
+        bail!("quasar top needs a terminal -- use --plain to pipe or redirect the stream");
+    }
+
     // Connect before taking over the terminal, so a failure to connect prints
     // an ordinary error instead of flashing an empty screen.
     let mut client = Client::connect(path).await?;
 
     install_panic_hook();
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().context("taking over the terminal")?;
     let result = drive(&mut terminal, &mut client).await;
     ratatui::restore();
     result
