@@ -8,7 +8,7 @@ use aya::maps::RingBuf;
 use clap::{Parser, Subcommand};
 use quasar::{
     event::{ConnectEvent, Event, ExecEvent},
-    loader,
+    loader::{self, DropCounter},
     registry::{Attribution, Registry},
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc};
@@ -65,15 +65,18 @@ async fn run(btf: Option<&Path>, docker: Option<&str>) -> Result<()> {
         }
     });
 
+    let exec_kernel_drops = DropCounter::take(&mut exec_ebpf, "exec")?;
+    let connect_kernel_drops = DropCounter::take(&mut connect_ebpf, "connect")?;
+
     // Separate buffers, so a flood of udp_sendmsg cannot starve the exec
     // stream. They are drained independently and merged onto one channel.
     let exec_map = exec_ebpf
-        .map_mut("exec_events")
+        .take_map("exec_events")
         .context("no exec_events map in the exec object")?;
     let mut exec_ring = AsyncFd::new(RingBuf::try_from(exec_map)?)?;
 
     let connect_map = connect_ebpf
-        .map_mut("connect_events")
+        .take_map("connect_events")
         .context("no connect_events map in the connect object")?;
     let mut connect_ring = AsyncFd::new(RingBuf::try_from(connect_map)?)?;
 
@@ -128,11 +131,30 @@ async fn run(btf: Option<&Path>, docker: Option<&str>) -> Result<()> {
     let _ = consumer.await;
     watcher.abort();
 
-    if dropped > 0 {
-        eprintln!("quasar: {dropped} events dropped, attribution could not keep up");
-    }
+    report_losses(dropped, &exec_kernel_drops, &connect_kernel_drops);
     eprintln!("quasar: detaching");
     Ok(())
+}
+
+/// Two different losses with two different fixes, so they are never summed.
+/// A kernel drop means the ring buffer was too small for the burst; a queue
+/// drop means attribution could not keep up with the drain.
+fn report_losses(queue_drops: u64, exec: &DropCounter, connect: &DropCounter) {
+    let (exec, connect) = (exec.total(), connect.total());
+
+    if exec + connect > 0 {
+        eprintln!(
+            "quasar: {} events dropped in the kernel, ring buffer full \
+             (exec={exec}, connect={connect})",
+            exec + connect
+        );
+    }
+    if queue_drops > 0 {
+        eprintln!(
+            "quasar: {queue_drops} events dropped in userspace, \
+             attribution could not keep up"
+        );
+    }
 }
 
 fn decode_exec(bytes: &[u8]) -> Option<Event> {

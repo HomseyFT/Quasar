@@ -1,3 +1,13 @@
+/* Egress probes.
+ *
+ * These record a connection *attempt*, not a completed connection. fentry runs
+ * at function entry, before the handshake, so a refused or timed-out connection
+ * produces an event exactly like a successful one does. That is the deliberate
+ * choice: the exfiltration attempt that failed is the one worth alerting on,
+ * and a monitor that only saw successes could be evaded by a peer that never
+ * answers. It does mean "connections" in the policy model means "attempts", and
+ * counts will exceed what netstat or a firewall log shows.
+ */
 #include "vmlinux.h"
 
 #include <bpf/bpf_core_read.h>
@@ -9,6 +19,12 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+/* What the kernel itself requires of the address argument. Matching it exactly
+ * matters in both directions: stricter would silently miss real egress, looser
+ * would report addresses the kernel is about to reject. */
+#define SOCKADDR_IN_LEN  16 /* sizeof(struct sockaddr_in) */
+#define SOCKADDR_IN6_MIN 24 /* SIN6_LEN_RFC2133 */
+
 /* Its own buffer, deliberately. pihole alone generates thousands of
  * udp_sendmsg calls per second, and a flood here must not be able to starve
  * the exec stream, which carries the primary signal. */
@@ -17,8 +33,43 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } connect_events SEC(".maps");
 
-/* fentry runs before the kernel function body, so the destination is not on
- * the sock yet -- it has to come from the sockaddr argument. */
+/* Reservation failures are the buffer overflowing. Counting them in the kernel
+ * is the only way userspace can know it happened -- a lost event is otherwise
+ * indistinguishable from an event that never occurred, which would silently
+ * corrupt anything phase 4 learns from observed behaviour. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} dropped SEC(".maps");
+
+static __always_inline void count_drop(void)
+{
+	__u32 key = 0;
+	__u64 *slot;
+
+	slot = bpf_map_lookup_elem(&dropped, &key);
+	if (slot)
+		(*slot)++; /* per-cpu, so no atomic is needed */
+}
+
+/* fentry runs before the kernel validates the address argument, so apply the
+ * same checks it is about to. A message the kernel rejects never reaches the
+ * wire, and reporting it would be a false positive scored as real egress. */
+static __always_inline int addr_ok(void *addr, int len, __u16 want_family, int min_len)
+{
+	__u16 family = 0;
+
+	if (!addr || len < min_len)
+		return 0;
+	/* sa_family_t is the first field of every sockaddr variant. */
+	if (bpf_probe_read_kernel(&family, sizeof(family), addr) != 0)
+		return 0;
+
+	return family == want_family;
+}
+
 static __always_inline struct connect_event *reserve(__u8 family, __u8 protocol)
 {
 	struct task_struct *task;
@@ -26,8 +77,10 @@ static __always_inline struct connect_event *reserve(__u8 family, __u8 protocol)
 	__u64 id;
 
 	e = bpf_ringbuf_reserve(&connect_events, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		count_drop();
 		return NULL;
+	}
 
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->cgroup_id = bpf_get_current_cgroup_id();
@@ -46,7 +99,7 @@ static __always_inline struct connect_event *reserve(__u8 family, __u8 protocol)
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
 	/* Every byte of the reservation is written: uninitialised bytes here
-	 * would ship kernel stack to userspace. */
+	 * would ship the tail of an earlier record to userspace. */
 	__builtin_memset(e->daddr, 0, sizeof(e->daddr));
 	e->dport = 0;
 	e->family = family;
@@ -56,12 +109,15 @@ static __always_inline struct connect_event *reserve(__u8 family, __u8 protocol)
 }
 
 SEC("fentry/tcp_v4_connect")
-int BPF_PROG(quasar_tcp_v4_connect, struct sock *sk, struct sockaddr *uaddr)
+int BPF_PROG(quasar_tcp_v4_connect, struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
 	struct sockaddr_in *sin = (struct sockaddr_in *)uaddr;
 	struct connect_event *e;
 	__u16 port = 0;
 	__u32 addr = 0;
+
+	if (!addr_ok(uaddr, addr_len, QUASAR_AF_INET, SOCKADDR_IN_LEN))
+		return 0;
 
 	BPF_CORE_READ_INTO(&addr, sin, sin_addr.s_addr);
 	BPF_CORE_READ_INTO(&port, sin, sin_port);
@@ -78,11 +134,14 @@ int BPF_PROG(quasar_tcp_v4_connect, struct sock *sk, struct sockaddr *uaddr)
 }
 
 SEC("fentry/tcp_v6_connect")
-int BPF_PROG(quasar_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr)
+int BPF_PROG(quasar_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
 	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)uaddr;
 	struct connect_event *e;
 	__u16 port = 0;
+
+	if (!addr_ok(uaddr, addr_len, QUASAR_AF_INET6, SOCKADDR_IN6_MIN))
+		return 0;
 
 	e = reserve(QUASAR_AF_INET6, QUASAR_PROTO_TCP);
 	if (!e)
@@ -103,9 +162,14 @@ int BPF_PROG(quasar_udp_sendmsg, struct sock *sk, struct msghdr *msg)
 	struct connect_event *e;
 	__u16 port = 0;
 	__u32 addr = 0;
+	int namelen;
 
 	sin = (struct sockaddr_in *)BPF_CORE_READ(msg, msg_name);
+	namelen = BPF_CORE_READ(msg, msg_namelen);
+
 	if (sin) {
+		if (!addr_ok(sin, namelen, QUASAR_AF_INET, SOCKADDR_IN_LEN))
+			return 0;
 		BPF_CORE_READ_INTO(&addr, sin, sin_addr.s_addr);
 		BPF_CORE_READ_INTO(&port, sin, sin_port);
 	} else {
@@ -120,6 +184,38 @@ int BPF_PROG(quasar_udp_sendmsg, struct sock *sk, struct msghdr *msg)
 		return 0;
 
 	__builtin_memcpy(e->daddr, &addr, sizeof(addr));
+	e->dport = bpf_ntohs(port);
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* udp_sendmsg is the AF_INET path only; native v6 datagrams go here. */
+SEC("fentry/udpv6_sendmsg")
+int BPF_PROG(quasar_udpv6_sendmsg, struct sock *sk, struct msghdr *msg)
+{
+	struct sockaddr_in6 *sin6;
+	struct connect_event *e;
+	__u16 port = 0;
+	int namelen;
+
+	sin6 = (struct sockaddr_in6 *)BPF_CORE_READ(msg, msg_name);
+	namelen = BPF_CORE_READ(msg, msg_namelen);
+
+	if (sin6 && !addr_ok(sin6, namelen, QUASAR_AF_INET6, SOCKADDR_IN6_MIN))
+		return 0;
+
+	e = reserve(QUASAR_AF_INET6, QUASAR_PROTO_UDP);
+	if (!e)
+		return 0;
+
+	if (sin6) {
+		BPF_CORE_READ_INTO(&e->daddr, sin6, sin6_addr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(&port, sin6, sin6_port);
+	} else {
+		BPF_CORE_READ_INTO(&e->daddr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(&port, sk, __sk_common.skc_dport);
+	}
 	e->dport = bpf_ntohs(port);
 
 	bpf_ringbuf_submit(e, 0);

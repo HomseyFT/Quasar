@@ -232,12 +232,27 @@ of starting is still attributed (test it deliberately).
 
 ### Phase 3 — egress
 
-`fentry` on `tcp_v4_connect`, `tcp_v6_connect`, `udp_sendmsg`. fentry rather
-than kprobe: lower overhead, and 6.8 supports it.
+`fentry` on `tcp_v4_connect`, `tcp_v6_connect`, `udp_sendmsg` and
+`udpv6_sendmsg`. fentry rather than kprobe: lower overhead, and 6.8 supports it.
+`udp_sendmsg` is the AF_INET path only, so v6 datagrams need the second hook or
+"both v4 and v6" is only true of TCP.
+
+**These record connection *attempts*, not completed connections.** fentry runs
+at function entry, before the handshake, so a refused or timed-out connection
+produces an event exactly like a successful one. That is the deliberate choice:
+the exfiltration attempt that failed is the one worth alerting on, and a monitor
+that only saw successes could be evaded by a peer that never answers. It follows
+that "connections" in the policy model means "attempts", and counts will exceed
+what netstat or a firewall log reports.
+
+Because fentry runs before the kernel validates its own arguments, each probe
+repeats the kernel's `addr_len` and `sa_family` checks. Skipping them would
+report a junk destination for any malformed `sendmsg` the kernel is about to
+reject -- a false positive that phase 4 would score as real egress.
 
 **Accepts when:** connections are captured with correct destination address and
-port on both v4 and v6, and measured overhead on the server stays under 2% CPU
-with pihole running.
+port on both v4 and v6, for TCP and UDP, and measured overhead on the server
+stays under 2% CPU with pihole running.
 
 ### Phase 4 — policy, learn mode, alerting
 

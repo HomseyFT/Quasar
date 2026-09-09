@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
+    maps::{MapData, PerCpuArray},
     programs::{FEntry, TracePoint},
     Btf, Ebpf, EbpfLoader, Endianness,
 };
@@ -23,7 +24,35 @@ const EGRESS_PROBES: &[(&str, &str)] = &[
     ("quasar_tcp_v4_connect", "tcp_v4_connect"),
     ("quasar_tcp_v6_connect", "tcp_v6_connect"),
     ("quasar_udp_sendmsg", "udp_sendmsg"),
+    ("quasar_udpv6_sendmsg", "udpv6_sendmsg"),
 ];
+
+/// Events the kernel could not fit into a ring buffer.
+///
+/// This is a different failure from the userspace queue overflowing, and it
+/// needs a different fix -- a bigger buffer rather than faster attribution --
+/// so the two are counted and reported separately.
+pub struct DropCounter(PerCpuArray<MapData, u64>);
+
+impl DropCounter {
+    /// Take the counter map out of a loaded object. Taking rather than
+    /// borrowing leaves the object free for the ring buffer to take too.
+    pub fn take(ebpf: &mut Ebpf, what: &str) -> Result<Self> {
+        let map = ebpf
+            .take_map("dropped")
+            .with_context(|| format!("no dropped map in the {what} object"))?;
+        Ok(Self(
+            PerCpuArray::try_from(map).with_context(|| format!("{what} dropped map"))?,
+        ))
+    }
+
+    pub fn total(&self) -> u64 {
+        self.0
+            .get(&0, 0)
+            .map(|per_cpu| per_cpu.iter().sum())
+            .unwrap_or(0)
+    }
+}
 
 fn load(object: &[u8], btf_path: Option<&Path>, what: &str) -> Result<Ebpf> {
     let btf = btf_path
