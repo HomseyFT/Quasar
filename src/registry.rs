@@ -41,6 +41,13 @@ const SHORT_ID_LEN: usize = 12;
 const DOCKER_TIMEOUT_SECS: u64 = 20;
 
 /// Who caused an event.
+///
+/// `Host` and `Unknown` are both "not a container", but they are not the same
+/// claim and must not be conflated. `Host` is positive evidence: the cgroup was
+/// found and its path names a system service. `Unknown` is the absence of
+/// evidence: the cgroup was gone and so was the process. The first is the
+/// ordinary case and carries no signal; the second is the interesting one,
+/// because it is what a deliberately short-lived process looks like.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attribution {
     /// Both the container and its name are known.
@@ -48,19 +55,28 @@ pub enum Attribution {
     /// The cgroup belongs to a container whose name is not known yet. Reached
     /// when an exec races the Docker event stream.
     Container { id: String },
-    /// No container could be determined.
-    Unattributed { cgroup_id: u64 },
+    /// The cgroup was found and is definitively not a container. The path is
+    /// relative to the cgroup root, e.g. `system.slice/firewalld.service`.
+    Host { path: String },
+    /// The cgroup could not be found at all, and neither could the process.
+    Unknown { cgroup_id: u64 },
 }
 
 impl Attribution {
-    pub fn is_attributed(&self) -> bool {
-        !matches!(self, Self::Unattributed { .. })
+    /// Whether this event came from a container, named or not.
+    pub fn is_container(&self) -> bool {
+        matches!(self, Self::Named { .. } | Self::Container { .. })
+    }
+
+    /// Whether attribution actually failed, as opposed to landing on the host.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown { .. })
     }
 
     pub fn container_id(&self) -> Option<&str> {
         match self {
             Self::Named { id, .. } | Self::Container { id } => Some(id),
-            Self::Unattributed { .. } => None,
+            Self::Host { .. } | Self::Unknown { .. } => None,
         }
     }
 }
@@ -70,8 +86,19 @@ impl fmt::Display for Attribution {
         match self {
             Self::Named { name, .. } => write!(f, "{name}"),
             Self::Container { id } => write!(f, "docker:{}", short(id)),
-            Self::Unattributed { cgroup_id } => write!(f, "cgroup:{cgroup_id}"),
+            Self::Host { path } => write!(f, "host:{path}"),
+            Self::Unknown { cgroup_id } => write!(f, "cgroup:{cgroup_id}"),
         }
+    }
+}
+
+/// Classify a cgroup path without consulting Docker: a container, or the host.
+pub fn classify_cgroup_path(path: &str) -> Attribution {
+    match container_id_from_cgroup_path(path) {
+        Some(id) => Attribution::Container { id: id.to_owned() },
+        None => Attribution::Host {
+            path: path.trim_start_matches('/').to_owned(),
+        },
     }
 }
 
@@ -129,11 +156,12 @@ fn find_cgroup_by_ino(root: &Path, ino: u64) -> Option<PathBuf> {
     None
 }
 
-/// Fallback 2: ask the process itself, if it is still alive.
-fn container_id_from_proc(pid: u32) -> Option<String> {
+/// Fallback 2: ask the process itself, if it is still alive. Unified v2 lines
+/// are `0::/system.slice/...`.
+fn proc_cgroup_path(pid: u32) -> Option<String> {
     let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     text.lines()
-        .find_map(|line| container_id_from_cgroup_path(line).map(str::to_owned))
+        .find_map(|line| line.split_once("::").map(|(_, path)| path.to_owned()))
 }
 
 #[derive(Default)]
@@ -187,22 +215,26 @@ impl Registry {
     }
 
     pub async fn resolve(&self, cgroup_id: u64, pid: u32) -> Attribution {
-        if let Some(hit) = self.state.read().await.by_cgroup.get(&cgroup_id) {
-            return hit.clone();
+        if let Some(hit) = self.cached(cgroup_id).await {
+            return hit;
         }
 
-        let attribution = match self.container_id_for(cgroup_id, pid) {
-            Some(id) => match self.name_for(&id).await {
+        let attribution = match self.locate(cgroup_id, pid) {
+            Some(Attribution::Container { id }) => match self.name_for(&id).await {
                 Some(name) => Attribution::Named { id, name },
                 None => Attribution::Container { id },
             },
-            None => Attribution::Unattributed { cgroup_id },
+            Some(host) => host,
+            None => Attribution::Unknown { cgroup_id },
         };
 
-        // Only a full resolution is cacheable. A bare container id means we
-        // raced the event stream, and an unattributed result may just mean the
-        // cgroup had not appeared yet -- both must be retried.
-        if matches!(attribution, Attribution::Named { .. }) {
+        // A bare container id means we raced the event stream, and Unknown may
+        // just mean the cgroup had not appeared yet -- both must be retried.
+        // Named and Host are stable enough to keep.
+        if matches!(
+            attribution,
+            Attribution::Named { .. } | Attribution::Host { .. }
+        ) {
             self.state
                 .write()
                 .await
@@ -213,12 +245,34 @@ impl Registry {
         attribution
     }
 
-    fn container_id_for(&self, cgroup_id: u64, pid: u32) -> Option<String> {
-        find_cgroup_by_ino(&self.cgroup_root, cgroup_id)
-            .and_then(|path| {
-                container_id_from_cgroup_path(&path.to_string_lossy()).map(str::to_owned)
-            })
-            .or_else(|| container_id_from_proc(pid))
+    /// A cached entry, if it is still true.
+    ///
+    /// Container entries are invalidated by the Docker event stream. Host
+    /// cgroups have no such stream, and their inodes can be reused after a
+    /// transient unit exits, so a host hit is confirmed with a single stat --
+    /// far cheaper than the tree walk it saves, and host processes are the bulk
+    /// of the traffic.
+    async fn cached(&self, cgroup_id: u64) -> Option<Attribution> {
+        let hit = self.state.read().await.by_cgroup.get(&cgroup_id)?.clone();
+
+        if let Attribution::Host { path } = &hit {
+            let live = fs::metadata(self.cgroup_root.join(path))
+                .is_ok_and(|metadata| metadata.ino() == cgroup_id);
+            if !live {
+                self.state.write().await.by_cgroup.remove(&cgroup_id);
+                return None;
+            }
+        }
+        Some(hit)
+    }
+
+    /// Fallbacks 1 and 2: the cgroup tree, then the process itself.
+    fn locate(&self, cgroup_id: u64, pid: u32) -> Option<Attribution> {
+        if let Some(path) = find_cgroup_by_ino(&self.cgroup_root, cgroup_id) {
+            let relative = path.strip_prefix(&self.cgroup_root).unwrap_or(&path);
+            return Some(classify_cgroup_path(&relative.to_string_lossy()));
+        }
+        proc_cgroup_path(pid).map(|path| classify_cgroup_path(&path))
     }
 
     async fn name_for(&self, id: &str) -> Option<String> {

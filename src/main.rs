@@ -137,10 +137,12 @@ fn print_exec(who: &Attribution, e: &ExecEvent) {
         e.uid,
         e.comm(),
         e.filename(),
-        if who.is_attributed() {
-            ""
-        } else {
+        // A host process is an ordinary, fully explained outcome and needs no
+        // marker. Only a genuine attribution failure is worth flagging.
+        if who.is_unknown() {
             "  [unattributed]"
+        } else {
+            ""
         },
     );
 }
