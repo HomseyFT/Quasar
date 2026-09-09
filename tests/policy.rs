@@ -1,0 +1,202 @@
+//! Policy precedence.
+//!
+//! The rule that makes a policy file trustworthy is that an automated pass
+//! never overwrites a human one. If that breaks, a deliberate denial silently
+//! reverts on the next `learn` run and nobody finds out until it matters.
+
+use std::net::IpAddr;
+
+use quasar::policy::{Decision, EgressRule, ExecRule, Policy, PolicySet, Source};
+
+fn manual_exec(path: &str) -> ExecRule {
+    ExecRule {
+        path: path.to_owned(),
+        source: Source::Manual,
+        note: Some("entrypoint only".to_owned()),
+    }
+}
+
+fn addr(s: &str) -> IpAddr {
+    s.parse().expect("test address")
+}
+
+#[test]
+fn deny_beats_allow() {
+    let mut policy = Policy::default();
+    policy.exec.allow.push(ExecRule {
+        path: "/bin/sh".to_owned(),
+        source: Source::Learned,
+        note: None,
+    });
+    policy.exec.deny.push(manual_exec("/bin/sh"));
+
+    assert_eq!(policy.check_exec("/bin/sh"), Decision::Denied);
+}
+
+#[test]
+fn learning_does_not_re_add_a_manually_denied_path() {
+    // The failure this guards: a human denies /bin/sh, the next learn run sees
+    // /bin/sh execute, adds it as learned, and the denial is gone.
+    let mut policy = Policy::default();
+    policy.exec.deny.push(manual_exec("/bin/sh"));
+
+    assert!(
+        !policy.learn_exec("/bin/sh"),
+        "learn must not add a denied path"
+    );
+    assert!(policy.exec.allow.is_empty());
+    assert_eq!(policy.check_exec("/bin/sh"), Decision::Denied);
+}
+
+#[test]
+fn learning_leaves_manual_entries_untouched() {
+    let mut policy = Policy::default();
+    policy.exec.allow.push(manual_exec("/bin/sh"));
+
+    assert!(!policy.learn_exec("/bin/sh"), "already allowed");
+    assert!(policy.learn_exec("/usr/bin/python3"));
+
+    let manual = policy
+        .exec
+        .allow
+        .iter()
+        .find(|rule| rule.path == "/bin/sh")
+        .expect("the manual entry survives");
+    assert_eq!(manual.source, Source::Manual);
+    assert_eq!(manual.note.as_deref(), Some("entrypoint only"));
+}
+
+#[test]
+fn learning_an_unbaselined_path_adds_it_once() {
+    let mut policy = Policy::default();
+
+    assert!(policy.learn_exec("/usr/local/bin/gunicorn"));
+    assert!(
+        !policy.learn_exec("/usr/local/bin/gunicorn"),
+        "no duplicate"
+    );
+    assert_eq!(policy.exec.allow.len(), 1);
+    assert_eq!(policy.exec.allow[0].source, Source::Learned);
+}
+
+#[test]
+fn a_broad_manual_cidr_absorbs_learned_host_routes() {
+    // This is how a human generalising a range stops the file filling up with
+    // one /32 per host.
+    let mut policy = Policy::default();
+    policy.egress.allow.push(EgressRule {
+        cidr: "10.0.0.0/8".parse().expect("cidr"),
+        source: Source::Manual,
+        note: Some("LAN + tailscale".to_owned()),
+    });
+
+    assert!(!policy.learn_egress(addr("10.12.1.73")));
+    assert!(!policy.learn_egress(addr("10.99.4.2")));
+    assert_eq!(policy.egress.allow.len(), 1);
+
+    // Something outside the range is still learned.
+    assert!(policy.learn_egress(addr("93.184.215.14")));
+    assert_eq!(policy.egress.allow.len(), 2);
+}
+
+#[test]
+fn egress_decisions_respect_cidr_containment() {
+    let mut policy = Policy::default();
+    policy.egress.allow.push(EgressRule {
+        cidr: "172.18.0.0/16".parse().expect("cidr"),
+        source: Source::Manual,
+        note: None,
+    });
+    policy.egress.deny.push(EgressRule {
+        cidr: "172.18.5.0/24".parse().expect("cidr"),
+        source: Source::Manual,
+        note: None,
+    });
+
+    assert_eq!(policy.check_egress(addr("172.18.1.1")), Decision::Allowed);
+    // A narrower deny inside a broader allow still wins.
+    assert_eq!(policy.check_egress(addr("172.18.5.9")), Decision::Denied);
+    assert_eq!(policy.check_egress(addr("8.8.8.8")), Decision::Unbaselined);
+}
+
+#[test]
+fn v6_destinations_are_expressible() {
+    // Phase 3 captures v6, so policy has to be able to talk about it.
+    let mut policy = Policy::default();
+    policy.egress.allow.push(EgressRule {
+        cidr: "2606:4700::/32".parse().expect("cidr"),
+        source: Source::Manual,
+        note: None,
+    });
+
+    assert_eq!(
+        policy.check_egress(addr("2606:4700:4700::1111")),
+        Decision::Allowed
+    );
+    assert!(policy.learn_egress(addr("2001:db8::1")));
+    assert_eq!(policy.egress.allow[1].cidr.prefix_len(), 128);
+}
+
+#[test]
+fn round_trips_through_toml() {
+    let dir = tempdir();
+    let mut set = PolicySet::default();
+    let policy = set.entry("marist-backend");
+    policy.meta.image = Some("infra-marist-backend".to_owned());
+    policy.exec.allow.push(manual_exec("/bin/sh"));
+    policy.learn_exec("/usr/local/bin/python3.12");
+    policy.learn_egress(addr("172.18.0.5"));
+
+    set.save_dir(&dir).expect("save");
+    let reloaded = PolicySet::load_dir(&dir).expect("load");
+
+    assert_eq!(
+        reloaded.by_container.get("marist-backend"),
+        set.by_container.get("marist-backend")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_missing_policy_directory_is_empty_not_an_error() {
+    // The service must start cleanly with no policy at all, so a bad or absent
+    // policy file can never prevent startup.
+    let set = PolicySet::load_dir(std::path::Path::new("/nonexistent/quasar/policy"))
+        .expect("a missing directory is not an error");
+    assert!(set.by_container.is_empty());
+}
+
+#[test]
+fn entries_are_sorted_on_save_so_diffs_stay_readable() {
+    let dir = tempdir();
+    let mut set = PolicySet::default();
+    let policy = set.entry("demo");
+    for path in ["/usr/bin/zsh", "/bin/cat", "/usr/bin/env"] {
+        policy.learn_exec(path);
+    }
+    set.save_dir(&dir).expect("save");
+
+    let text = std::fs::read_to_string(dir.join("demo.toml")).expect("read");
+    let order: Vec<_> = text
+        .match_indices("path = ")
+        .map(|(i, _)| text[i..].lines().next().unwrap_or_default().to_owned())
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(
+        order, sorted,
+        "policy entries must be written in sorted order"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn tempdir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "quasar-policy-test-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
