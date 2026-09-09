@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use super::{Policy, PolicySet};
-use crate::sink::jsonl::{Attributed, Body, Record};
+use crate::sink::record::{Attributed, Body, Record};
 
 #[derive(Debug, Default)]
 pub struct ContainerObservations {

@@ -295,6 +295,21 @@ alerts; and `docker exec marist-backend sh` fires an ntfy notification.
 The unix socket server and the ratatui client. Per-container counters, a live
 event tail, alert highlighting.
 
+Split, because the acceptance criterion is entirely about the daemon and none of
+it is about rendering: **5a** is the socket server, the counters and a plain
+client that prints frames; **5b** is the ratatui view. The property worth proving
+is provable before any of the drawing exists.
+
+**Nothing on the publishing side ever awaits a client.** Fan-out is a broadcast:
+a client that stops reading fills its own queue, loses its own frames, and is
+sent the size of the gap. A client that blocks blocks only its own task, and a
+client that dies is dropped without the error propagating. The socket is mode
+0600 -- the stream is every exec and every destination on the host.
+
+A client sees events from the moment the daemon accepts it, which is a slightly
+later instant than its `connect` returning. The immediate counter snapshot is the
+first frame, so receiving it is proof the subscription is live.
+
 **Accepts when:** the daemon runs headless with no client attached, and attaching
 or killing a client never affects it.
 

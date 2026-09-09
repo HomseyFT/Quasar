@@ -18,7 +18,7 @@ cd "$REPO" || exit 1
 
 BIN=${BIN:-./target/debug/quasar}
 PHASES=("$@")
-[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c)
+[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c 5)
 
 [ "${QUASAR_TEST_ROOT:-}" = 1 ] || {
     echo "refusing to run without QUASAR_TEST_ROOT=1 -- this starts and removes containers" >&2
@@ -458,6 +458,66 @@ PY
                 && ok "ten identical execs collapse into one notification" \
                 || bad "ten identical execs produced $n notifications"
         }
+    }
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 5 -- the daemon is unaffected by clients.
+# ---------------------------------------------------------------------------
+if want_phase 5; then
+    section 5 "clients cannot affect the daemon"
+    SOCK=$WORK/quasar.sock
+    boot quasar-p5 alpine sleep 300
+
+    start_quasar --socket "$SOCK" && {
+        # Headless first: no client has ever attached.
+        docker exec quasar-p5 /bin/echo headless >/dev/null 2>&1
+        sleep 2
+        assert_some "the daemon logs with no client attached" \
+            'r["source"] == "quasar-p5" and r.get("path") == "/bin/echo"'
+
+        [ -S "$SOCK" ] && ok "the socket exists" || bad "no socket at $SOCK"
+        mode=$(stat -c '%a' "$SOCK" 2>/dev/null)
+        [ "$mode" = "600" ] \
+            && ok "the socket is not readable by others" \
+            || bad "the socket mode is $mode, wanted 600"
+
+        # Two clients at once, both fed from the same stream.
+        "$BIN" top --socket "$SOCK" > "$WORK/client-a.out" 2>/dev/null &
+        CLIENT_A=$!
+        "$BIN" top --socket "$SOCK" > "$WORK/client-b.out" 2>/dev/null &
+        CLIENT_B=$!
+        sleep 2
+
+        docker exec quasar-p5 /bin/date >/dev/null 2>&1
+        sleep 2
+
+        grep -q '/bin/date' "$WORK/client-a.out" \
+            && ok "an attached client sees events" \
+            || bad "the client saw nothing"
+        grep -q '/bin/date' "$WORK/client-b.out" \
+            && ok "a second client sees the same events" \
+            || bad "the second client saw nothing"
+        grep -q 'execs' "$WORK/client-a.out" \
+            && ok "the client receives counter snapshots" \
+            || bad "the client received no counters"
+
+        # The criterion: kill a client mid-stream and the daemon does not care.
+        kill -9 "$CLIENT_A" 2>/dev/null
+        kill -9 "$CLIENT_B" 2>/dev/null
+        wait "$CLIENT_A" "$CLIENT_B" 2>/dev/null
+        sleep 1
+
+        kill -0 "$QPID" 2>/dev/null \
+            && ok "the daemon survives a client being killed" \
+            || bad "the daemon died when a client was killed"
+
+        docker exec quasar-p5 /bin/sh -c 'echo after-the-client-died' >/dev/null 2>&1
+        sleep 2
+        stop_quasar
+
+        assert_some "the daemon keeps logging after every client is gone" \
+            'r["source"] == "quasar-p5" and r.get("path") == "/bin/sh"'
     }
 fi
 

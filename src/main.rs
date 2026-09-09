@@ -22,6 +22,8 @@ use quasar::{
     sink::{
         jsonl::JsonlSink,
         ntfy::{self, Admit, Alert, AlertKey, NtfySink, Suppressor},
+        record::{Body, Clock, Record},
+        socket::{self, Client, Frame},
     },
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc, time::MissedTickBehavior};
@@ -46,6 +48,13 @@ enum Command {
     /// Attach the probes and stream events to stdout.
     Run(RunArgs),
 
+    /// Attach to a running daemon and watch what it sees.
+    Top {
+        /// The daemon's socket.
+        #[arg(long, value_name = "PATH", default_value = socket::DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
     /// Turn an observed log into draft policy files.
     ///
     /// Re-runnable: manual entries are never touched, so correcting a file by
@@ -67,8 +76,49 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Run(args) => run(&args).await,
+        Command::Top { socket } => top(&socket).await,
         Command::Learn { from, out } => learn_policy(&from, &out),
     }
+}
+
+/// Attach to a running daemon. Deliberately a separate process from the
+/// monitor: this can be killed, backgrounded or run twenty times over without
+/// the daemon noticing.
+async fn top(path: &Path) -> Result<()> {
+    let mut client = Client::connect(path).await?;
+    eprintln!("quasar: attached to {}", path.display());
+
+    while let Some(frame) = client.next().await? {
+        match frame {
+            Frame::Event { record } => println!("{}", describe(&record)),
+            Frame::Stats { snapshot } => println!(
+                "-- {} execs, {} connects, {} alerts across {} sources --",
+                snapshot.total.execs,
+                snapshot.total.connects,
+                snapshot.total.alerts,
+                snapshot.by_source.len()
+            ),
+            // The gap is shown rather than hidden: a live view that looks
+            // continuous when it is not is worse than one that admits it.
+            Frame::Lagged { missed } => {
+                println!("-- fell behind, {missed} events missed --");
+            }
+        }
+    }
+
+    eprintln!("quasar: the daemon closed the connection");
+    Ok(())
+}
+
+fn describe(record: &Record) -> String {
+    let what = match &record.body {
+        Body::Exec { path } => format!("exec {path}"),
+        Body::Connect { proto, dest, port } => format!("connect {proto} {dest}:{port}"),
+    };
+    format!(
+        "[{}] {:<24} pid={} uid={} comm={} {what}",
+        record.time, record.source, record.pid, record.uid, record.comm
+    )
 }
 
 fn learn_policy(from: &Path, out: &Path) -> Result<()> {
@@ -122,6 +172,11 @@ struct RunArgs {
     /// unbaselined. Without it quasar observes and logs but never notifies.
     #[arg(long, value_name = "URL")]
     ntfy: Option<String>,
+
+    /// Serve a live event tail and counters on this unix socket for
+    /// `quasar top`. Without it the daemon has no socket at all.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 
     /// Do not print events. The JSONL log and every diagnostic on stderr are
     /// unaffected. stdout is line buffered, so a syscall per event is real
@@ -210,6 +265,21 @@ async fn run(args: &RunArgs) -> Result<()> {
     });
 
     let mut sink = jsonl.map(JsonlSink::create).transpose()?;
+    let clock = Clock::new()?;
+
+    // Attaching, killing or multiplying clients must not change what the
+    // monitor does, so the server is started once and never awaited on.
+    let publisher = args
+        .socket
+        .as_deref()
+        .map(socket::serve)
+        .transpose()?
+        .inspect(|_| {
+            eprintln!(
+                "quasar: serving {}",
+                args.socket.as_deref().unwrap_or(Path::new("")).display()
+            );
+        });
 
     let alert_drops = Arc::new(AtomicU64::new(0));
     let alerts = spawn_alerter(args.ntfy.as_deref(), Arc::clone(&alert_drops))?;
@@ -222,25 +292,33 @@ async fn run(args: &RunArgs) -> Result<()> {
             while let Some(event) = rx.recv().await {
                 let who = registry.resolve(event.cgroup_id(), event.pid()).await;
 
-                if let Some(tx) = &alerts {
-                    if let Some(alert) = alert_for(&policies, &who, &event) {
-                        // An alert that cannot be queued is dropped rather than
-                        // allowed to stall event processing, and counted so the
-                        // loss is not silent.
-                        if tx.try_send(alert).is_err() {
-                            alert_drops.fetch_add(1, Ordering::Relaxed);
-                        }
+                let alert = alert_for(&policies, &who, &event);
+                let alerted = alert.is_some();
+
+                if let (Some(tx), Some(alert)) = (&alerts, alert) {
+                    // An alert that cannot be queued is dropped rather than
+                    // allowed to stall event processing, and counted so the
+                    // loss is not silent.
+                    if tx.try_send(alert).is_err() {
+                        alert_drops.fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
-                let logged = match &event {
-                    Event::Exec(e) => sink.as_mut().map(|s| s.write_exec(&who, e)),
-                    Event::Connect(e) => sink.as_mut().map(|s| s.write_connect(&who, e)),
+                // Built once. The log and the socket serve the same value, so
+                // they cannot disagree about what happened.
+                let record = match &event {
+                    Event::Exec(e) => clock.exec(&who, e),
+                    Event::Connect(e) => clock.connect(&who, e),
                 };
+
                 // A log write that fails must not take the monitor down, but it
                 // must not pass unnoticed either.
-                if let Some(Err(error)) = logged {
+                if let Some(Err(error)) = sink.as_mut().map(|s| s.write(&record)) {
                     eprintln!("quasar: log write failed: {error:#}");
+                }
+
+                if let Some(publisher) = &publisher {
+                    publisher.publish(&record, alerted);
                 }
                 if !quiet {
                     match event {
