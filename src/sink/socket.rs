@@ -26,7 +26,10 @@ use tokio::{
 };
 
 use super::record::Record;
-use crate::stats::{Counters, Snapshot};
+use crate::{
+    policy::Decision,
+    stats::{Counters, Snapshot},
+};
 
 pub const DEFAULT_SOCKET: &str = "/run/quasar.sock";
 
@@ -45,6 +48,11 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 pub enum Frame {
     Event {
         record: Record,
+        /// What the policy made of it, when a policy governs it at all. The
+        /// counters know how many events alerted; the view needs to know
+        /// which, and to tell a denial from something merely unbaselined.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<Decision>,
     },
     Stats {
         snapshot: Snapshot,
@@ -59,14 +67,14 @@ pub enum Frame {
 /// The monitor's end. Cloneable, cheap, and never blocking.
 #[derive(Clone)]
 pub struct Publisher {
-    events: broadcast::Sender<Record>,
+    events: broadcast::Sender<(Record, Option<Decision>)>,
     counters: Arc<Mutex<Counters>>,
 }
 
 impl Publisher {
-    pub fn publish(&self, record: &Record, alerted: bool) {
+    pub fn publish(&self, record: &Record, decision: Option<Decision>) {
         if let Ok(mut counters) = self.counters.lock() {
-            counters.record(record, alerted);
+            counters.record(record, decision);
         }
 
         // Cloning only when somebody is listening keeps the headless case --
@@ -74,7 +82,7 @@ impl Publisher {
         if self.events.receiver_count() > 0 {
             // Errors only when the last receiver went away between the check
             // and the send. Nothing to do about that, and nothing to report.
-            let _ = self.events.send(record.clone());
+            let _ = self.events.send((record.clone(), decision));
         }
     }
 }
@@ -109,7 +117,7 @@ pub fn serve(path: &Path) -> Result<Publisher> {
 
 async fn accept(
     listener: UnixListener,
-    events: broadcast::Sender<Record>,
+    events: broadcast::Sender<(Record, Option<Decision>)>,
     counters: Arc<Mutex<Counters>>,
 ) {
     loop {
@@ -133,7 +141,7 @@ async fn accept(
 
 async fn talk(
     mut stream: UnixStream,
-    mut events: broadcast::Receiver<Record>,
+    mut events: broadcast::Receiver<(Record, Option<Decision>)>,
     counters: Arc<Mutex<Counters>>,
 ) -> Result<()> {
     // Immediately, so a client that just attached shows real numbers instead
@@ -146,7 +154,9 @@ async fn talk(
     loop {
         tokio::select! {
             received = events.recv() => match received {
-                Ok(record) => send(&mut stream, &Frame::Event { record }).await?,
+                Ok((record, decision)) => {
+                    send(&mut stream, &Frame::Event { record, decision }).await?;
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     send(&mut stream, &Frame::Lagged { missed }).await?;
                 }

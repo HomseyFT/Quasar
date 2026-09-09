@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sink::record::{Body, Record};
+use crate::{
+    policy::Decision,
+    sink::record::{Body, Record},
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counts {
@@ -31,7 +34,7 @@ pub struct Counters {
 }
 
 impl Counters {
-    pub fn record(&mut self, record: &Record, alerted: bool) {
+    pub fn record(&mut self, record: &Record, decision: Option<Decision>) {
         let entry = self
             .snapshot
             .by_source
@@ -43,7 +46,7 @@ impl Counters {
                 Body::Exec { .. } => counts.execs += 1,
                 Body::Connect { .. } => counts.connects += 1,
             }
-            if alerted {
+            if decision.is_some() {
                 counts.alerts += 1;
             }
         }

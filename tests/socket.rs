@@ -8,6 +8,7 @@ use std::{
 };
 
 use quasar::{
+    policy::Decision,
     sink::{
         record::{Attributed, Body, Record},
         socket::{serve, Client, Frame},
@@ -65,7 +66,7 @@ async fn attach(path: &std::path::Path) -> Client {
 async fn next_event(client: &mut Client) -> Option<Record> {
     for _ in 0..8 {
         match next(client).await? {
-            Frame::Event { record } => return Some(record),
+            Frame::Event { record, .. } => return Some(record),
             _ => continue,
         }
     }
@@ -77,6 +78,7 @@ fn frames_round_trip() {
     let frames = [
         Frame::Event {
             record: record("api", "/bin/sh"),
+            decision: Some(Decision::Denied),
         },
         Frame::Stats {
             snapshot: Snapshot::default(),
@@ -102,7 +104,10 @@ fn a_connect_frame_round_trips() {
         dest: "9.9.9.9".parse::<IpAddr>().expect("addr"),
         port: 443,
     };
-    let frame = Frame::Event { record: r };
+    let frame = Frame::Event {
+        record: r,
+        decision: Some(Decision::Unbaselined),
+    };
 
     let line = serde_json::to_string(&frame).expect("serialise");
     assert_eq!(
@@ -119,7 +124,7 @@ async fn a_client_sees_events_and_an_immediate_snapshot() {
     // that just attached shows real numbers rather than a blank screen.
     let mut client = attach(&path).await;
 
-    publisher.publish(&record("api", "/bin/sh"), false);
+    publisher.publish(&record("api", "/bin/sh"), None);
 
     let got = next_event(&mut client).await.expect("an event");
     assert_eq!(got.source, "api");
@@ -139,9 +144,9 @@ async fn counters_track_what_was_published() {
     let publisher = serve(&path).expect("serve");
     let mut client = attach(&path).await;
 
-    publisher.publish(&record("api", "/bin/sh"), false);
-    publisher.publish(&record("api", "/bin/nc"), true);
-    publisher.publish(&record("db", "/bin/sh"), false);
+    publisher.publish(&record("api", "/bin/sh"), None);
+    publisher.publish(&record("api", "/bin/nc"), Some(Decision::Unbaselined));
+    publisher.publish(&record("db", "/bin/sh"), None);
 
     let mut seen = None;
     for _ in 0..64 {
@@ -175,7 +180,7 @@ async fn a_client_that_stops_reading_loses_its_own_frames() {
     // holds, so the client's queue must overflow.
     let started = Instant::now();
     for i in 0..20_000 {
-        publisher.publish(&record("api", &format!("/bin/{i}")), false);
+        publisher.publish(&record("api", &format!("/bin/{i}")), None);
     }
     let publishing = started.elapsed();
 
@@ -212,11 +217,11 @@ async fn a_dead_client_does_not_disturb_the_next_one() {
     let client = Client::connect(&path).await.expect("connect");
     drop(client);
     for i in 0..100 {
-        publisher.publish(&record("api", &format!("/bin/{i}")), false);
+        publisher.publish(&record("api", &format!("/bin/{i}")), None);
     }
 
     let mut fresh = attach(&path).await;
-    publisher.publish(&record("api", "/bin/after"), false);
+    publisher.publish(&record("api", "/bin/after"), None);
 
     let got = next_event(&mut fresh).await.expect("an event");
     assert_eq!(
@@ -236,11 +241,11 @@ async fn publishing_with_no_client_attached_is_fine() {
     let publisher = serve(&path).expect("serve");
 
     for i in 0..10_000 {
-        publisher.publish(&record("api", &format!("/bin/{i}")), false);
+        publisher.publish(&record("api", &format!("/bin/{i}")), None);
     }
 
     let mut client = attach(&path).await;
-    publisher.publish(&record("api", "/bin/late"), false);
+    publisher.publish(&record("api", "/bin/late"), None);
     assert!(next_event(&mut client).await.is_some());
 
     let _ = std::fs::remove_file(&path);
@@ -268,7 +273,7 @@ async fn a_stale_socket_file_is_replaced() {
 
     let publisher = serve(&path).expect("serve over the stale socket");
     let mut client = attach(&path).await;
-    publisher.publish(&record("api", "/bin/sh"), false);
+    publisher.publish(&record("api", "/bin/sh"), None);
     assert!(next_event(&mut client).await.is_some());
 
     let _ = std::fs::remove_file(&path);

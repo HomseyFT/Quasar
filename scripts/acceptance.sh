@@ -482,15 +482,25 @@ if want_phase 5; then
             && ok "the socket is not readable by others" \
             || bad "the socket mode is $mode, wanted 600"
 
-        # Two clients at once, both fed from the same stream.
-        "$BIN" top --socket "$SOCK" > "$WORK/client-a.out" 2>/dev/null &
+        # Two clients at once, both fed from the same stream. --plain because
+        # asserting on a rendered screen would test the drawing, which the unit
+        # tests cover, rather than the daemon property this phase is about.
+        "$BIN" top --socket "$SOCK" --plain > "$WORK/client-a.out" 2>/dev/null &
         CLIENT_A=$!
-        "$BIN" top --socket "$SOCK" > "$WORK/client-b.out" 2>/dev/null &
+        "$BIN" top --socket "$SOCK" --plain > "$WORK/client-b.out" 2>/dev/null &
         CLIENT_B=$!
+
+        # The real screen, on a pty, so the terminal path is exercised too.
+        script -qec "$BIN top --socket $SOCK" /dev/null > "$WORK/client-tui.out" 2>&1 &
+        CLIENT_TUI=$!
         sleep 2
 
         docker exec quasar-p5 /bin/date >/dev/null 2>&1
         sleep 2
+
+        kill -0 "$CLIENT_TUI" 2>/dev/null \
+            && ok "the terminal client attaches and stays up" \
+            || bad "the terminal client exited early"
 
         grep -q '/bin/date' "$WORK/client-a.out" \
             && ok "an attached client sees events" \
@@ -502,10 +512,17 @@ if want_phase 5; then
             && ok "the client receives counter snapshots" \
             || bad "the client received no counters"
 
+        # Without a policy loaded nothing is judged, so nothing is marked --
+        # the control for the highlighting assertion in the policy run below.
+        grep -q 'UNBASELINED\|DENIED' "$WORK/client-a.out" \
+            && bad "events were marked with no policy loaded" \
+            || ok "nothing is marked when no policy governs the container"
+
         # The criterion: kill a client mid-stream and the daemon does not care.
         kill -9 "$CLIENT_A" 2>/dev/null
         kill -9 "$CLIENT_B" 2>/dev/null
-        wait "$CLIENT_A" "$CLIENT_B" 2>/dev/null
+        kill -9 "$CLIENT_TUI" 2>/dev/null
+        wait "$CLIENT_A" "$CLIENT_B" "$CLIENT_TUI" 2>/dev/null
         sleep 1
 
         kill -0 "$QPID" 2>/dev/null \
@@ -518,6 +535,35 @@ if want_phase 5; then
 
         assert_some "the daemon keeps logging after every client is gone" \
             'r["source"] == "quasar-p5" and r.get("path") == "/bin/sh"'
+    }
+
+    # Highlighting needs a policy to judge against, so learn one and run again.
+    POLICY=$WORK/p5-policy
+    "$BIN" learn --from "$JSONL" --out "$POLICY" >/dev/null 2>&1
+
+    start_quasar --socket "$SOCK" --policy "$POLICY" && {
+        "$BIN" top --socket "$SOCK" --plain > "$WORK/client-c.out" 2>/dev/null &
+        CLIENT_C=$!
+        sleep 2
+
+        # Something the first run never did, so the learned policy cannot
+        # already allow it -- an allowed exec dies in the kernel and would
+        # never reach the client to be marked at all.
+        docker exec quasar-p5 /bin/uname -a >/dev/null 2>&1
+        sleep 2
+        kill -9 "$CLIENT_C" 2>/dev/null
+        wait "$CLIENT_C" 2>/dev/null
+        stop_quasar
+
+        grep -q 'UNBASELINED.*exec /bin/uname' "$WORK/client-c.out" \
+            && ok "an unbaselined event is marked for the client" \
+            || bad "the client did not mark an unbaselined event"
+
+        # The other half: what the policy allows is filtered in the kernel and
+        # never reaches the client at all.
+        grep -q 'exec /bin/date' "$WORK/client-c.out" \
+            && bad "an allowed exec still reached the client" \
+            || ok "an allowed exec never reaches the client"
     }
 fi
 

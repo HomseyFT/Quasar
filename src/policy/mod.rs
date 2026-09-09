@@ -102,7 +102,8 @@ pub struct Policy {
 }
 
 /// What the policy says about one observation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Decision {
     Allowed,
     /// Matched a deny rule. Deny always beats allow.

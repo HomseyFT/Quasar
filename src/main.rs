@@ -22,9 +22,10 @@ use quasar::{
     sink::{
         jsonl::JsonlSink,
         ntfy::{self, Admit, Alert, AlertKey, NtfySink, Suppressor},
-        record::{Body, Clock, Record},
-        socket::{self, Client, Frame},
+        record::Clock,
+        socket,
     },
+    tui,
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc, time::MissedTickBehavior};
 
@@ -58,6 +59,10 @@ enum Command {
         /// The daemon's socket.
         #[arg(long, value_name = "PATH", default_value = socket::DEFAULT_SOCKET)]
         socket: PathBuf,
+
+        /// One line per frame instead of a screen, for piping and scripting.
+        #[arg(long)]
+        plain: bool,
     },
 
     /// Turn an observed log into draft policy files.
@@ -81,49 +86,15 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Run(args) => run(&args).await,
-        Command::Top { socket } => top(&socket).await,
-        Command::Learn { from, out } => learn_policy(&from, &out),
-    }
-}
-
-/// Attach to a running daemon. Deliberately a separate process from the
-/// monitor: this can be killed, backgrounded or run twenty times over without
-/// the daemon noticing.
-async fn top(path: &Path) -> Result<()> {
-    let mut client = Client::connect(path).await?;
-    eprintln!("quasar: attached to {}", path.display());
-
-    while let Some(frame) = client.next().await? {
-        match frame {
-            Frame::Event { record } => println!("{}", describe(&record)),
-            Frame::Stats { snapshot } => println!(
-                "-- {} execs, {} connects, {} alerts across {} sources --",
-                snapshot.total.execs,
-                snapshot.total.connects,
-                snapshot.total.alerts,
-                snapshot.by_source.len()
-            ),
-            // The gap is shown rather than hidden: a live view that looks
-            // continuous when it is not is worse than one that admits it.
-            Frame::Lagged { missed } => {
-                println!("-- fell behind, {missed} events missed --");
+        Command::Top { socket, plain } => {
+            if plain {
+                tui::run_plain(&socket).await
+            } else {
+                tui::run(&socket).await
             }
         }
+        Command::Learn { from, out } => learn_policy(&from, &out),
     }
-
-    eprintln!("quasar: the daemon closed the connection");
-    Ok(())
-}
-
-fn describe(record: &Record) -> String {
-    let what = match &record.body {
-        Body::Exec { path } => format!("exec {path}"),
-        Body::Connect { proto, dest, port } => format!("connect {proto} {dest}:{port}"),
-    };
-    format!(
-        "[{}] {:<24} pid={} uid={} comm={} {what}",
-        record.time, record.source, record.pid, record.uid, record.comm
-    )
 }
 
 fn learn_policy(from: &Path, out: &Path) -> Result<()> {
@@ -314,7 +285,7 @@ async fn run(args: &RunArgs) -> Result<()> {
                 let who = registry.resolve(event.cgroup_id(), event.pid()).await;
 
                 let alert = alert_for(&policies, &who, &event);
-                let alerted = alert.is_some();
+                let decision = alert.as_ref().map(|alert| alert.key.decision);
 
                 if let (Some(tx), Some(alert)) = (&alerts, alert) {
                     // An alert that cannot be queued is dropped rather than
@@ -339,7 +310,7 @@ async fn run(args: &RunArgs) -> Result<()> {
                 }
 
                 if let Some(publisher) = &publisher {
-                    publisher.publish(&record, alerted);
+                    publisher.publish(&record, decision);
                 }
                 if !quiet {
                     match event {

@@ -300,6 +300,16 @@ it is about rendering: **5a** is the socket server, the counters and a plain
 client that prints frames; **5b** is the ratatui view. The property worth proving
 is provable before any of the drawing exists.
 
+`quasar top --plain` keeps the line-per-frame output. A screen that cannot be
+piped into `grep` is worse than one that can, and it is what the acceptance
+suite drives: asserting on a rendered terminal would test the drawing, which the
+state tests already cover, rather than the daemon property the phase is about.
+
+The event frame carries the policy's decision, so a denial can be shown
+differently from something merely unbaselined. It rides on the frame and not on
+the log record: the log is what happened, and a decision is a judgement made by
+whichever policy happened to be loaded at the time.
+
 **Nothing on the publishing side ever awaits a client.** Fan-out is a broadcast:
 a client that stops reading fills its own queue, loses its own frames, and is
 sent the size of the gap. A client that blocks blocks only its own task, and a
