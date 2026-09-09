@@ -25,6 +25,20 @@ pub struct ContainerObservations {
     pub last_seen: Option<String>,
 }
 
+/// Whether a path is stable enough to be worth a policy rule.
+///
+/// runc re-execs itself through `/proc/self/fd/<n>` on every container start --
+/// the CVE-2019-5736 mitigation. The descriptor number varies, so learning it
+/// yields a rule that never matches the next start: it fails to suppress the
+/// alert *and* adds another dead entry every time. As an allow rule it would
+/// also mean "whatever that descriptor points at", which is not something a
+/// policy can usefully permit.
+///
+/// These are still logged and still evaluated; they are just not baselined.
+fn is_stable_path(path: &str) -> bool {
+    !path.starts_with("/proc/")
+}
+
 #[derive(Debug, Default)]
 pub struct Observations {
     pub per_container: BTreeMap<String, ContainerObservations>,
@@ -33,6 +47,8 @@ pub struct Observations {
     /// number here means the policy is being learned from partial data.
     pub unattributable: usize,
     pub malformed_lines: usize,
+    /// Execs through a path that cannot be matched again, so not baselined.
+    pub unstable_paths: usize,
     pub total: usize,
 }
 
@@ -67,6 +83,10 @@ pub fn observe(log: &Path) -> Result<Observations> {
 
         match record.body {
             Body::Exec { path } => {
+                if !is_stable_path(&path) {
+                    observations.unstable_paths += 1;
+                    continue;
+                }
                 entry.exec_paths.insert(path);
             }
             Body::Connect { dest, .. } => {

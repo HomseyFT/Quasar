@@ -86,6 +86,12 @@ fn learn_policy(from: &Path, out: &Path) -> Result<()> {
         "{} containers: {} exec rules and {} egress rules added, {} already covered",
         summary.containers, summary.exec_added, summary.egress_added, summary.already_covered,
     );
+    if observations.unstable_paths > 0 {
+        println!(
+            "{} execs through an unstable /proc path not baselined (runc container init)",
+            observations.unstable_paths,
+        );
+    }
     println!("wrote {}", out.display());
     println!("review with: git diff {}", out.display());
 

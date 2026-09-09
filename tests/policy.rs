@@ -200,3 +200,37 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
+
+#[test]
+fn unstable_proc_paths_are_not_baselined() {
+    // runc re-execs through /proc/self/fd/<n> on every container start. The
+    // descriptor number varies, so learning it produces a rule that never
+    // matches again and grows a new dead entry each time.
+    let dir = tempdir();
+    let log = dir.join("unstable.jsonl");
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"time":"2026-09-09T06:40:07Z","source":"demo","attributed":"named","pid":1,"ppid":1,"uid":0,"comm":"6","kind":"exec","path":"/proc/self/fd/6"}"#,
+            "\n",
+            r#"{"time":"2026-09-09T06:40:08Z","source":"demo","attributed":"named","pid":2,"ppid":1,"uid":0,"comm":"sh","kind":"exec","path":"/bin/sh"}"#,
+            "\n",
+        ),
+    )
+    .expect("write log");
+
+    let observations = quasar::policy::learn::observe(&log).expect("observe");
+    assert_eq!(observations.unstable_paths, 1);
+
+    let out = dir.join("policy");
+    quasar::policy::learn::merge_into(&observations, &out).expect("merge");
+
+    let text = std::fs::read_to_string(out.join("demo.toml")).expect("read");
+    assert!(text.contains("/bin/sh"), "real paths are still learned");
+    assert!(
+        !text.contains("/proc/self/fd"),
+        "an unmatchable path must never reach the policy file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
