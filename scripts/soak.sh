@@ -122,6 +122,7 @@ PREV_WALL=$(date +%s%N)
 START_WALL=$PREV_WALL
 START_CNT=$PREV_CNT
 START_NS=$PREV_NS
+START_LINES=$PREV_LINES
 
 echo "elapsed_s,quasar_cpu_pct_host,probe_cpu_pct_host,total_pct_host,rss_kb,events_per_s,probe_runs_per_s,ns_per_run" > "$CSV"
 
@@ -172,7 +173,7 @@ echo
 echo "===================== RESULTS ====================="
 awk -v w="$(( END_WALL - START_WALL ))" -v ncpu="$NCPU" -v tick="$TICK" \
     -v cpu="$TOTAL_CPU" -v dns="$(( END_NS - START_NS ))" \
-    -v dcnt="$(( END_CNT - START_CNT ))" -v dl="$END_LINES" -v rss="$MAX_RSS" '
+    -v dcnt="$(( END_CNT - START_CNT ))" -v dl="$(( END_LINES - START_LINES ))" -v rss="$MAX_RSS" '
     BEGIN {
         secs = w / 1e9
         user = (cpu / tick) / secs * 100 / ncpu
