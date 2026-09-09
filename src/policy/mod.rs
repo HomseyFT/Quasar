@@ -9,6 +9,7 @@
 //! diff and the review would stop happening.
 
 pub mod learn;
+pub mod sync;
 
 use std::{
     collections::BTreeMap,

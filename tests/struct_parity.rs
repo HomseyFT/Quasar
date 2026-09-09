@@ -9,7 +9,9 @@
 use std::mem::{align_of, offset_of, size_of};
 
 use quasar::event::{
-    ConnectEvent, ExecEvent, QUASAR_ADDR_LEN, QUASAR_COMM_LEN, QUASAR_FILENAME_LEN,
+    cidr_data as CidrData, cidr_data6 as CidrData6, cidr_key as CidrKey, cidr_key6 as CidrKey6,
+    exec_key as ExecKey, ConnectEvent, ExecEvent, QUASAR_ADDR_LEN, QUASAR_CGROUP_PREFIX_BITS,
+    QUASAR_COMM_LEN, QUASAR_FILENAME_LEN, QUASAR_HASH_LEN,
 };
 
 #[test]
@@ -92,4 +94,51 @@ fn connect_event_has_no_padding() {
         "connect_event grew padding; the probe writes every byte it reserves, so \
          padding ships uninitialised kernel stack to userspace"
     );
+}
+
+// ---- allowlist map keys --------------------------------------------------
+//
+// A wrong size here is not a subtle bug: the kernel rejects an LPM_TRIE whose
+// key_size does not count the prefix length, and a HASH lookup with a
+// differently-shaped key silently never matches.
+
+#[test]
+fn exec_key_layout_is_pinned() {
+    assert_eq!(size_of::<ExecKey>(), 24, "exec_key size");
+    assert_eq!(align_of::<ExecKey>(), 8);
+    assert_eq!(offset_of!(ExecKey, cgroup_id), 0);
+    assert_eq!(offset_of!(ExecKey, path_hash), 8);
+    assert_eq!(
+        size_of::<ExecKey>(),
+        size_of::<u64>() + QUASAR_HASH_LEN as usize,
+        "exec_key must have no padding: it is compared byte for byte"
+    );
+}
+
+#[test]
+fn lpm_keys_count_the_prefix_length() {
+    // The kernel's LPM key is a prefix length immediately followed by its data,
+    // and key_size counts both. aya builds the same shape from the data type,
+    // so these two must line up or the map is rejected at load.
+    assert_eq!(size_of::<CidrKey>(), 4 + size_of::<CidrData>());
+    assert_eq!(size_of::<CidrKey6>(), 4 + size_of::<CidrData6>());
+}
+
+#[test]
+fn lpm_key_data_has_no_padding() {
+    // Alignment 1 throughout, so nothing is inserted after prefixlen and the
+    // compared bits are exactly cgroup id followed by address.
+    assert_eq!(align_of::<CidrData>(), 1);
+    assert_eq!(align_of::<CidrData6>(), 1);
+    assert_eq!(size_of::<CidrData>(), 8 + 4);
+    assert_eq!(size_of::<CidrData6>(), 8 + QUASAR_ADDR_LEN as usize);
+    assert_eq!(offset_of!(CidrData, cgroup_id), 0);
+    assert_eq!(offset_of!(CidrData, addr), 8);
+    assert_eq!(offset_of!(CidrData6, addr), 8);
+}
+
+#[test]
+fn the_cgroup_prefix_covers_the_whole_id() {
+    // Every lookup matches the container exactly before matching the address.
+    assert_eq!(QUASAR_CGROUP_PREFIX_BITS, u64::BITS);
 }

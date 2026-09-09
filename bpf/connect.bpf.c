@@ -44,6 +44,51 @@ struct {
 	__uint(max_entries, 1);
 } dropped SEC(".maps");
 
+/* Longest-prefix matching in the kernel, so 10.0.0.0/8 is one entry rather
+ * than sixteen million. This is what makes pihole affordable: its DNS traffic
+ * matches an allowlist entry and dies here. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct cidr_key);
+	__type(value, __u8);
+	__uint(max_entries, 8192);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_allow SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct cidr_key6);
+	__type(value, __u8);
+	__uint(max_entries, 8192);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_allow6 SEC(".maps");
+
+/* A lookup asks for the full-length prefix; a stored /8 still matches, because
+ * the trie compares only as many bits as the stored entry itself carries. */
+static __always_inline int egress_allowed_v4(__u64 cgroup_id, const __u8 addr[4])
+{
+	struct cidr_key key;
+
+	__builtin_memset(&key, 0, sizeof(key));
+	key.prefixlen = QUASAR_CGROUP_PREFIX_BITS + 32;
+	__builtin_memcpy(key.data.cgroup_id, &cgroup_id, sizeof(cgroup_id));
+	__builtin_memcpy(key.data.addr, addr, sizeof(key.data.addr));
+
+	return bpf_map_lookup_elem(&egress_allow, &key) != NULL;
+}
+
+static __always_inline int egress_allowed_v6(__u64 cgroup_id, const __u8 addr[QUASAR_ADDR_LEN])
+{
+	struct cidr_key6 key;
+
+	__builtin_memset(&key, 0, sizeof(key));
+	key.prefixlen = QUASAR_CGROUP_PREFIX_BITS + 128;
+	__builtin_memcpy(key.data.cgroup_id, &cgroup_id, sizeof(cgroup_id));
+	__builtin_memcpy(key.data.addr, addr, sizeof(key.data.addr));
+
+	return bpf_map_lookup_elem(&egress_allow6, &key) != NULL;
+}
+
 static __always_inline void count_drop(void)
 {
 	__u32 key = 0;
@@ -122,6 +167,9 @@ int BPF_PROG(quasar_tcp_v4_connect, struct sock *sk, struct sockaddr *uaddr, int
 	BPF_CORE_READ_INTO(&addr, sin, sin_addr.s_addr);
 	BPF_CORE_READ_INTO(&port, sin, sin_port);
 
+	if (egress_allowed_v4(bpf_get_current_cgroup_id(), (const __u8 *)&addr))
+		return 0;
+
 	e = reserve(QUASAR_AF_INET, QUASAR_PROTO_TCP);
 	if (!e)
 		return 0;
@@ -138,16 +186,21 @@ int BPF_PROG(quasar_tcp_v6_connect, struct sock *sk, struct sockaddr *uaddr, int
 {
 	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)uaddr;
 	struct connect_event *e;
+	__u8 addr[QUASAR_ADDR_LEN];
 	__u16 port = 0;
 
 	if (!addr_ok(uaddr, addr_len, QUASAR_AF_INET6, SOCKADDR_IN6_MIN))
+		return 0;
+
+	BPF_CORE_READ_INTO(&addr, sin6, sin6_addr.in6_u.u6_addr8);
+	if (egress_allowed_v6(bpf_get_current_cgroup_id(), addr))
 		return 0;
 
 	e = reserve(QUASAR_AF_INET6, QUASAR_PROTO_TCP);
 	if (!e)
 		return 0;
 
-	BPF_CORE_READ_INTO(&e->daddr, sin6, sin6_addr.in6_u.u6_addr8);
+	__builtin_memcpy(e->daddr, addr, sizeof(addr));
 	BPF_CORE_READ_INTO(&port, sin6, sin6_port);
 	e->dport = bpf_ntohs(port);
 
@@ -179,6 +232,9 @@ int BPF_PROG(quasar_udp_sendmsg, struct sock *sk, struct msghdr *msg)
 		BPF_CORE_READ_INTO(&port, sk, __sk_common.skc_dport);
 	}
 
+	if (egress_allowed_v4(bpf_get_current_cgroup_id(), (const __u8 *)&addr))
+		return 0;
+
 	e = reserve(QUASAR_AF_INET, QUASAR_PROTO_UDP);
 	if (!e)
 		return 0;
@@ -196,6 +252,7 @@ int BPF_PROG(quasar_udpv6_sendmsg, struct sock *sk, struct msghdr *msg)
 {
 	struct sockaddr_in6 *sin6;
 	struct connect_event *e;
+	__u8 addr[QUASAR_ADDR_LEN];
 	__u16 port = 0;
 	int namelen;
 
@@ -205,17 +262,22 @@ int BPF_PROG(quasar_udpv6_sendmsg, struct sock *sk, struct msghdr *msg)
 	if (sin6 && !addr_ok(sin6, namelen, QUASAR_AF_INET6, SOCKADDR_IN6_MIN))
 		return 0;
 
+	if (sin6) {
+		BPF_CORE_READ_INTO(&addr, sin6, sin6_addr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(&port, sin6, sin6_port);
+	} else {
+		BPF_CORE_READ_INTO(&addr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(&port, sk, __sk_common.skc_dport);
+	}
+
+	if (egress_allowed_v6(bpf_get_current_cgroup_id(), addr))
+		return 0;
+
 	e = reserve(QUASAR_AF_INET6, QUASAR_PROTO_UDP);
 	if (!e)
 		return 0;
 
-	if (sin6) {
-		BPF_CORE_READ_INTO(&e->daddr, sin6, sin6_addr.in6_u.u6_addr8);
-		BPF_CORE_READ_INTO(&port, sin6, sin6_port);
-	} else {
-		BPF_CORE_READ_INTO(&e->daddr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-		BPF_CORE_READ_INTO(&port, sk, __sk_common.skc_dport);
-	}
+	__builtin_memcpy(e->daddr, addr, sizeof(addr));
 	e->dport = bpf_ntohs(port);
 
 	bpf_ringbuf_submit(e, 0);

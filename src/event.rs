@@ -16,9 +16,10 @@ mod sys {
 
 pub use sys::connect_event as ConnectEvent;
 pub use sys::exec_event as ExecEvent;
+pub use sys::{cidr_data, cidr_data6, cidr_key, cidr_key6, exec_key};
 pub use sys::{
-    QUASAR_ADDR_LEN, QUASAR_AF_INET, QUASAR_AF_INET6, QUASAR_COMM_LEN, QUASAR_FILENAME_LEN,
-    QUASAR_PROTO_TCP, QUASAR_PROTO_UDP,
+    QUASAR_ADDR_LEN, QUASAR_AF_INET, QUASAR_AF_INET6, QUASAR_CGROUP_PREFIX_BITS, QUASAR_COMM_LEN,
+    QUASAR_FILENAME_LEN, QUASAR_HASH_LEN, QUASAR_PROTO_TCP, QUASAR_PROTO_UDP,
 };
 
 /// Decode one ring buffer record. Returns `None` if the record is too short to

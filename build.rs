@@ -23,6 +23,21 @@ fn main() {
     }
 
     generate_bindings(bpf_dir, &out_dir);
+    compile_host_hash(bpf_dir);
+}
+
+/// The path hash again, for the host, so a test can compare the C against the
+/// Rust. Both sides must produce identical bytes or every allowlist lookup
+/// misses and the kernel-side filter quietly stops filtering.
+fn compile_host_hash(bpf_dir: &Path) {
+    let shim = bpf_dir.join("hash_host.c");
+    println!("cargo:rerun-if-changed={}", shim.display());
+
+    cc::Build::new()
+        .file(&shim)
+        .include(bpf_dir)
+        .warnings(true)
+        .compile("quasar_hash_host");
 }
 
 fn compile_probe(probe: &str, bpf_dir: &Path, out_dir: &Path) {
@@ -58,6 +73,11 @@ fn generate_bindings(bpf_dir: &Path, out_dir: &Path) {
         .header(header.to_str().expect("common.h path is not utf-8"))
         .allowlist_type("exec_event")
         .allowlist_type("connect_event")
+        .allowlist_type("exec_key")
+        .allowlist_type("cidr_key")
+        .allowlist_type("cidr_key6")
+        .allowlist_type("cidr_data")
+        .allowlist_type("cidr_data6")
         .allowlist_var("QUASAR_.*")
         .derive_copy(true)
         .layout_tests(false)

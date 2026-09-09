@@ -9,8 +9,12 @@ use clap::{Parser, Subcommand};
 use quasar::{
     event::{ConnectEvent, Event, ExecEvent},
     loader::{self, DropCounter},
-    policy::learn,
-    registry::{Attribution, Registry},
+    policy::{
+        learn,
+        sync::{manual_deny_count, MapSync},
+        PolicySet,
+    },
+    registry::{Attribution, ContainerChange, Registry},
     sink::jsonl::JsonlSink,
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc};
@@ -42,6 +46,11 @@ enum Command {
         /// Also append every event to this durable JSONL log.
         #[arg(long, value_name = "PATH")]
         jsonl: Option<PathBuf>,
+
+        /// Push these policy files into the kernel, so allowed events are
+        /// filtered in the probe and never reach userspace.
+        #[arg(long, value_name = "DIR")]
+        policy: Option<PathBuf>,
     },
 
     /// Turn an observed log into draft policy files.
@@ -64,8 +73,19 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     match Cli::parse().command {
-        Command::Run { btf, docker, jsonl } => {
-            run(btf.as_deref(), docker.as_deref(), jsonl.as_deref()).await
+        Command::Run {
+            btf,
+            docker,
+            jsonl,
+            policy,
+        } => {
+            run(
+                btf.as_deref(),
+                docker.as_deref(),
+                jsonl.as_deref(),
+                policy.as_deref(),
+            )
+            .await
         }
         Command::Learn { from, out } => learn_policy(&from, &out),
     }
@@ -98,7 +118,12 @@ fn learn_policy(from: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run(btf: Option<&Path>, docker: Option<&str>, jsonl: Option<&Path>) -> Result<()> {
+async fn run(
+    btf: Option<&Path>,
+    docker: Option<&str>,
+    jsonl: Option<&Path>,
+    policy_dir: Option<&Path>,
+) -> Result<()> {
     let mut exec_ebpf = loader::load_exec(btf)?;
     loader::attach_exec(&mut exec_ebpf)?;
 
@@ -114,6 +139,14 @@ async fn run(btf: Option<&Path>, docker: Option<&str>, jsonl: Option<&Path>) -> 
             Registry::offline()
         }
     });
+
+    // Policy goes down before the ring buffers are drained, so a known-good
+    // event is already being filtered by the time the first one could arrive.
+    let policies = match policy_dir {
+        Some(dir) => PolicySet::load_dir(dir)?,
+        None => PolicySet::default(),
+    };
+    let mut sync = MapSync::take(&mut exec_ebpf, &mut connect_ebpf)?;
 
     let exec_kernel_drops = DropCounter::take(&mut exec_ebpf, "exec")?;
     let connect_kernel_drops = DropCounter::take(&mut connect_ebpf, "connect")?;
@@ -133,6 +166,36 @@ async fn run(btf: Option<&Path>, docker: Option<&str>, jsonl: Option<&Path>) -> 
     // Attribution can await a Docker round trip, which must never stall the
     // ring buffer drain -- the kernel would overwrite records while we waited.
     let (tx, mut rx) = mpsc::channel::<Event>(EVENT_QUEUE_DEPTH);
+
+    sync_all(&mut sync, &policies, &registry).await;
+
+    let (changes_tx, mut changes_rx) = mpsc::channel::<ContainerChange>(64);
+
+    // A container's cgroup id changes every time it starts, so its allowlist
+    // has to be rewritten under the new id or nothing matches.
+    let resync = tokio::spawn({
+        let policies = policies.clone();
+        async move {
+            while let Some(change) = changes_rx.recv().await {
+                match change {
+                    ContainerChange::Started { name, cgroup_id } => {
+                        if let Some(policy) = policies.by_container.get(&name) {
+                            let applied = sync.apply(cgroup_id, policy);
+                            eprintln!(
+                                "quasar: {name} started, {} exec and {} egress rules applied",
+                                applied.exec, applied.egress
+                            );
+                        }
+                    }
+                    ContainerChange::Stopped { name, cgroup_id } => {
+                        if let Some(policy) = policies.by_container.get(&name) {
+                            sync.clear(cgroup_id, policy);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let mut sink = jsonl.map(JsonlSink::create).transpose()?;
 
@@ -163,7 +226,7 @@ async fn run(btf: Option<&Path>, docker: Option<&str>, jsonl: Option<&Path>) -> 
 
     let watcher = tokio::spawn({
         let registry = Arc::clone(&registry);
-        async move { registry.watch().await }
+        async move { registry.watch(Some(changes_tx)).await }
     });
 
     eprintln!(
@@ -194,6 +257,7 @@ async fn run(btf: Option<&Path>, docker: Option<&str>, jsonl: Option<&Path>) -> 
     drop(tx);
     let _ = consumer.await;
     watcher.abort();
+    resync.abort();
 
     report_losses(dropped, &exec_kernel_drops, &connect_kernel_drops);
     eprintln!("quasar: detaching");
@@ -218,6 +282,43 @@ fn report_losses(queue_drops: u64, exec: &DropCounter, connect: &DropCounter) {
             "quasar: {queue_drops} events dropped in userspace, \
              attribution could not keep up"
         );
+    }
+}
+
+/// Push every loaded policy down under the cgroup id its container is running
+/// as right now. A container with no policy is simply not filtered.
+async fn sync_all(sync: &mut MapSync, policies: &PolicySet, registry: &Registry) {
+    if policies.by_container.is_empty() {
+        return;
+    }
+
+    let mut synced = 0;
+    let mut denies = 0;
+    for (name, cgroup_id) in registry.running_containers().await {
+        let Some(policy) = policies.by_container.get(&name) else {
+            continue;
+        };
+        let applied = sync.apply(cgroup_id, policy);
+        if applied.rejected > 0 {
+            eprintln!(
+                "quasar: {name}: {} rules would not fit in the allowlist maps",
+                applied.rejected
+            );
+        }
+        denies += manual_deny_count(policy);
+        synced += 1;
+    }
+
+    eprintln!(
+        "quasar: policy loaded for {} of {} containers ({} running)",
+        synced,
+        policies.by_container.len(),
+        registry.running_containers().await.len(),
+    );
+    if denies > 0 {
+        // Deny rules deliberately do not go into the maps: a denied event has
+        // to reach userspace to be alerted on.
+        eprintln!("quasar: {denies} manual deny rules are enforced in userspace, not the kernel");
     }
 }
 

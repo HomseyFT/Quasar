@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 
 [build-dependencies]
 bindgen = "0.72"
+cc = "1"
 
 [dev-dependencies]
 aya-obj = "0.2"

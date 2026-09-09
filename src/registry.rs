@@ -132,8 +132,12 @@ fn is_container_id(s: &str) -> bool {
     s.len() == CONTAINER_ID_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Find the cgroup directory whose inode number is `ino`.
-fn find_cgroup_by_ino(root: &Path, ino: u64) -> Option<PathBuf> {
+/// Walk the cgroup tree until `matches` accepts a directory.
+///
+/// Needed in both directions: an event gives a cgroup id and wants a path,
+/// while syncing policy gives a container id and wants the cgroup id it is
+/// currently running as.
+fn find_cgroup(root: &Path, mut matches: impl FnMut(&Path, u64) -> bool) -> Option<(PathBuf, u64)> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -147,13 +151,28 @@ fn find_cgroup_by_ino(root: &Path, ino: u64) -> Option<PathBuf> {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if metadata.ino() == ino {
-                return Some(entry.path());
+            let path = entry.path();
+            let ino = metadata.ino();
+            if matches(&path, ino) {
+                return Some((path, ino));
             }
-            stack.push(entry.path());
+            stack.push(path);
         }
     }
     None
+}
+
+fn find_cgroup_by_ino(root: &Path, ino: u64) -> Option<PathBuf> {
+    find_cgroup(root, |_, candidate| candidate == ino).map(|(path, _)| path)
+}
+
+/// The cgroup id a container is running as right now. It changes every time the
+/// container starts, which is why the allowlist maps are re-synced then.
+fn find_cgroup_for_container(root: &Path, container_id: &str) -> Option<u64> {
+    find_cgroup(root, |path, _| {
+        container_id_from_cgroup_path(&path.to_string_lossy()) == Some(container_id)
+    })
+    .map(|(_, ino)| ino)
 }
 
 /// Fallback 2: ask the process itself, if it is still alive. Unified v2 lines
@@ -162,6 +181,13 @@ fn proc_cgroup_path(pid: u32) -> Option<String> {
     let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     text.lines()
         .find_map(|line| line.split_once("::").map(|(_, path)| path.to_owned()))
+}
+
+/// A container appearing or going away, so the allowlist maps can follow it.
+#[derive(Clone, Debug)]
+pub enum ContainerChange {
+    Started { name: String, cgroup_id: u64 },
+    Stopped { name: String, cgroup_id: u64 },
 }
 
 #[derive(Default)]
@@ -307,9 +333,44 @@ impl Registry {
         Ok(())
     }
 
+    /// The cgroup id a named container is currently running as.
+    pub async fn cgroup_id_for_name(&self, name: &str) -> Option<u64> {
+        let id = {
+            let state = self.state.read().await;
+            state
+                .names
+                .iter()
+                .find(|(_, known)| known.as_str() == name)
+                .map(|(id, _)| id.clone())?
+        };
+        find_cgroup_for_container(&self.cgroup_root, &id)
+    }
+
+    /// Every named container currently running, with its cgroup id.
+    pub async fn running_containers(&self) -> Vec<(String, u64)> {
+        let names: Vec<(String, String)> = {
+            let state = self.state.read().await;
+            state
+                .names
+                .iter()
+                .map(|(id, name)| (id.clone(), name.clone()))
+                .collect()
+        };
+
+        names
+            .into_iter()
+            .filter_map(|(id, name)| {
+                find_cgroup_for_container(&self.cgroup_root, &id).map(|cgroup| (name, cgroup))
+            })
+            .collect()
+    }
+
     /// Follow the Docker event stream, keeping the cache honest. Returns when
     /// the stream ends or there is no Docker connection.
-    pub async fn watch(&self) {
+    ///
+    /// `changes` receives container lifecycle transitions so the allowlist maps
+    /// can be rewritten under the container's new cgroup id.
+    pub async fn watch(&self, changes: Option<tokio::sync::mpsc::Sender<ContainerChange>>) {
         let Some(docker) = &self.docker else {
             return;
         };
@@ -327,11 +388,39 @@ impl Registry {
             match action.as_str() {
                 "start" => {
                     let _ = self.refresh_names().await;
+                    self.announce(&changes, &id, true).await;
                 }
-                "die" | "destroy" => self.forget(&id).await,
+                "die" | "destroy" => {
+                    self.announce(&changes, &id, false).await;
+                    self.forget(&id).await;
+                }
                 _ => {}
             }
         }
+    }
+
+    async fn announce(
+        &self,
+        changes: &Option<tokio::sync::mpsc::Sender<ContainerChange>>,
+        container_id: &str,
+        started: bool,
+    ) {
+        let Some(changes) = changes else { return };
+        let Some(name) = self.state.read().await.names.get(container_id).cloned() else {
+            return;
+        };
+        // A stopped container's cgroup is often already gone, so its id can only
+        // come from what we resolved while it was alive.
+        let Some(cgroup_id) = find_cgroup_for_container(&self.cgroup_root, container_id) else {
+            return;
+        };
+
+        let change = if started {
+            ContainerChange::Started { name, cgroup_id }
+        } else {
+            ContainerChange::Stopped { name, cgroup_id }
+        };
+        let _ = changes.send(change).await;
     }
 
     /// Drop everything known about a container. Cgroup inodes can be reused
