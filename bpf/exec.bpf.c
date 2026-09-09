@@ -11,7 +11,7 @@ char LICENSE[] SEC("license") = "GPL";
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
-} events SEC(".maps");
+} exec_events SEC(".maps");
 
 SEC("tracepoint/sched/sched_process_exec")
 int quasar_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -22,7 +22,7 @@ int quasar_exec(struct trace_event_raw_sched_process_exec *ctx)
 	__u64 id;
 	int len;
 
-	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	e = bpf_ringbuf_reserve(&exec_events, sizeof(*e), 0);
 	if (!e)
 		return 0;
 

@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-const PROBES: &[&str] = &["exec"];
+const PROBES: &[&str] = &["exec", "connect"];
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
@@ -57,6 +57,7 @@ fn generate_bindings(bpf_dir: &Path, out_dir: &Path) {
     bindgen::Builder::default()
         .header(header.to_str().expect("common.h path is not utf-8"))
         .allowlist_type("exec_event")
+        .allowlist_type("connect_event")
         .allowlist_var("QUASAR_.*")
         .derive_copy(true)
         .layout_tests(false)
