@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -35,6 +35,11 @@ const EVENT_QUEUE_DEPTH: usize = 4096;
 /// Small on purpose. Suppression means a healthy system produces a trickle, so
 /// a full queue means ntfy is unreachable and the backlog is already stale.
 const ALERT_QUEUE_DEPTH: usize = 256;
+
+/// The log is buffered, so it is only durable as far as the last flush. This
+/// bounds what a SIGKILL or a power loss can take with it -- an audit trail
+/// that loses its last few thousand records is not one.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(name = "quasar", version, about = "eBPF container security monitor")]
@@ -289,7 +294,23 @@ async fn run(args: &RunArgs) -> Result<()> {
         let policies = Arc::clone(&policies);
         let alert_drops = Arc::clone(&alert_drops);
         async move {
-            while let Some(event) = rx.recv().await {
+            let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+            flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                let event = tokio::select! {
+                    received = rx.recv() => match received {
+                        Some(event) => event,
+                        None => break,
+                    },
+                    _ = flush.tick() => {
+                        if let Some(Err(error)) = sink.as_mut().map(JsonlSink::flush) {
+                            eprintln!("quasar: flushing the log failed: {error:#}");
+                        }
+                        continue;
+                    }
+                };
+
                 let who = registry.resolve(event.cgroup_id(), event.pid()).await;
 
                 let alert = alert_for(&policies, &who, &event);
