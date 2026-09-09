@@ -5,7 +5,7 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 BIN         := target/$(MUSL_TARGET)/release/quasar
 TARGET_BTF  := testdata/btf/ubuntu-6.8.0-139
 
-.PHONY: all build dev run test lint vmlinux deps deploy clean
+.PHONY: all build dev run test lint vmlinux deps deploy soak clean
 
 all: build
 
@@ -45,6 +45,13 @@ $(TARGET_BTF):
 deploy: build
 	scp $(BIN) $(DEPLOY_HOST):/tmp/quasar
 	ssh $(DEPLOY_HOST) 'sudo install -m 755 /tmp/quasar $(DEPLOY_PATH)'
+
+## soak: ship the overhead benchmark to the server and print how to run it
+soak: deploy
+	scp scripts/soak.sh $(DEPLOY_HOST):/tmp/soak.sh
+	@echo
+	@echo "sudo on the server wants a password, so run it yourself:"
+	@echo "    ssh -t $(DEPLOY_HOST) 'sudo bash /tmp/soak.sh --minutes 60'"
 
 ## deps: report on the build prerequisites
 deps:
