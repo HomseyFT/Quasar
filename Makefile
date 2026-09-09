@@ -44,7 +44,7 @@ $(TARGET_BTF):
 
 deploy: build
 	scp $(BIN) $(DEPLOY_HOST):/tmp/quasar
-	ssh $(DEPLOY_HOST) 'sudo install -m 755 /tmp/quasar $(DEPLOY_PATH)'
+	ssh -t $(DEPLOY_HOST) 'sudo install -m 755 /tmp/quasar $(DEPLOY_PATH)'
 
 ## soak: ship the overhead benchmark to the server and print how to run it
 soak: deploy

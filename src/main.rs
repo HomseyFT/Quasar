@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use aya::maps::RingBuf;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use quasar::{
     event::{ConnectEvent, Event, ExecEvent},
     loader::{self, DropCounter},
@@ -33,25 +33,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Attach the probes and stream events to stdout.
-    Run {
-        /// Relocate against this BTF blob instead of the running kernel.
-        #[arg(long, value_name = "PATH")]
-        btf: Option<PathBuf>,
-
-        /// Docker endpoint. Defaults to the local unix socket; pass a
-        /// host:port to use docker-socket-proxy instead.
-        #[arg(long, value_name = "ENDPOINT")]
-        docker: Option<String>,
-
-        /// Also append every event to this durable JSONL log.
-        #[arg(long, value_name = "PATH")]
-        jsonl: Option<PathBuf>,
-
-        /// Push these policy files into the kernel, so allowed events are
-        /// filtered in the probe and never reach userspace.
-        #[arg(long, value_name = "DIR")]
-        policy: Option<PathBuf>,
-    },
+    Run(RunArgs),
 
     /// Turn an observed log into draft policy files.
     ///
@@ -73,20 +55,7 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     match Cli::parse().command {
-        Command::Run {
-            btf,
-            docker,
-            jsonl,
-            policy,
-        } => {
-            run(
-                btf.as_deref(),
-                docker.as_deref(),
-                jsonl.as_deref(),
-                policy.as_deref(),
-            )
-            .await
-        }
+        Command::Run(args) => run(&args).await,
         Command::Learn { from, out } => learn_policy(&from, &out),
     }
 }
@@ -118,12 +87,39 @@ fn learn_policy(from: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run(
-    btf: Option<&Path>,
-    docker: Option<&str>,
-    jsonl: Option<&Path>,
-    policy_dir: Option<&Path>,
-) -> Result<()> {
+#[derive(Args)]
+struct RunArgs {
+    /// Relocate against this BTF blob instead of the running kernel.
+    #[arg(long, value_name = "PATH")]
+    btf: Option<PathBuf>,
+
+    /// Docker endpoint. Defaults to the local unix socket; pass a
+    /// host:port to use docker-socket-proxy instead.
+    #[arg(long, value_name = "ENDPOINT")]
+    docker: Option<String>,
+
+    /// Also append every event to this durable JSONL log.
+    #[arg(long, value_name = "PATH")]
+    jsonl: Option<PathBuf>,
+
+    /// Push these policy files into the kernel, so allowed events are
+    /// filtered in the probe and never reach userspace.
+    #[arg(long, value_name = "DIR")]
+    policy: Option<PathBuf>,
+
+    /// Do not print events. The JSONL log and every diagnostic on stderr are
+    /// unaffected. stdout is line buffered, so a syscall per event is real
+    /// cost at pihole's rates -- an unattended run should not pay it.
+    #[arg(long)]
+    quiet: bool,
+}
+
+async fn run(args: &RunArgs) -> Result<()> {
+    let btf = args.btf.as_deref();
+    let docker = args.docker.as_deref();
+    let jsonl = args.jsonl.as_deref();
+    let policy_dir = args.policy.as_deref();
+    let quiet = args.quiet;
     let mut exec_ebpf = loader::load_exec(btf)?;
     loader::attach_exec(&mut exec_ebpf)?;
 
@@ -213,9 +209,11 @@ async fn run(
                 if let Some(Err(error)) = logged {
                     eprintln!("quasar: log write failed: {error:#}");
                 }
-                match event {
-                    Event::Exec(e) => print_exec(&who, &e),
-                    Event::Connect(e) => print_connect(&who, &e),
+                if !quiet {
+                    match event {
+                        Event::Exec(e) => print_exec(&who, &e),
+                        Event::Connect(e) => print_connect(&who, &e),
+                    }
                 }
             }
             if let Some(Err(error)) = sink.as_mut().map(JsonlSink::flush) {

@@ -96,7 +96,7 @@ proc_cpu() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
 proc_rss() { awk '/^VmRSS:/ {print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
 lines()    { if [ "$JSONL" = none ]; then echo 0; else wc -l < "$JSONL" 2>/dev/null || echo 0; fi; }
 
-ARGS=(run)
+ARGS=(run --quiet)
 [ "$JSONL" = none ] || ARGS+=(--jsonl "$JSONL")
 [ -z "$POLICY" ]    || ARGS+=(--policy "$POLICY")
 
