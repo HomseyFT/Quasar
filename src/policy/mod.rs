@@ -177,6 +177,14 @@ impl Policy {
         }
     }
 
+    /// Whether this policy could let a container run at all.
+    ///
+    /// A policy with no exec allow rules permits nothing, so enforcing it
+    /// would stop the container executing anything -- a brick, not a policy.
+    pub fn can_govern(&self) -> bool {
+        !self.exec.allow.is_empty()
+    }
+
     /// Record an observed exec as `learned`. Returns whether anything changed.
     ///
     /// Nothing is added unless the observation is currently unbaselined, which

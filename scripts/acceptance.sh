@@ -18,7 +18,7 @@ cd "$REPO" || exit 1
 
 BIN=${BIN:-./target/debug/quasar}
 PHASES=("$@")
-[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c 5 6a)
+[ ${#PHASES[@]} -eq 0 ] && PHASES=(1 2 3 4a 4b 4c 5 6a 6b)
 
 [ "${QUASAR_TEST_ROOT:-}" = 1 ] || {
     echo "refusing to run without QUASAR_TEST_ROOT=1 -- this starts and removes containers" >&2
@@ -644,6 +644,110 @@ if want_phase 6a; then
 
             assert_none "arming does not survive into a daemon that did not ask for it" \
                 'r.get("outcome") == "would_block"'
+        }
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6b -- enforcement, and the rails that make it survivable.
+# ---------------------------------------------------------------------------
+if want_phase 6b; then
+    section 6b "enforcement"
+
+    if ! grep -q '\bbpf\b' /sys/kernel/security/lsm 2>/dev/null; then
+        bad "BPF LSM is not in the active list -- add ',bpf' to lsm= and reboot"
+    else
+        boot quasar-p6b alpine sleep 400
+
+        start_quasar && {
+            docker exec quasar-p6b /bin/echo baseline >/dev/null 2>&1
+            docker exec quasar-p6b /bin/sh -c 'true' >/dev/null 2>&1
+            sleep 2
+            stop_quasar
+        }
+        POLICY=$WORK/p6b-policy
+        "$BIN" learn --from "$JSONL" --out "$POLICY" >/dev/null 2>&1
+
+        start_quasar --policy "$POLICY" --enforce quasar-p6b && {
+            # The criterion: refused, and the container is still there.
+            if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
+                bad "a disallowed exec was NOT refused"
+            else
+                ok "a disallowed exec is refused"
+            fi
+
+            [ "$(docker inspect -f '{{.State.Running}}' quasar-p6b 2>/dev/null)" = "true" ] \
+                && ok "the container survives being enforced against" \
+                || bad "the container died"
+
+            # The control. Enforcement that refuses everything is not policy.
+            ALIVE=$(docker exec quasar-p6b /bin/echo alive 2>/dev/null)
+            [ "$ALIVE" = "alive" ] \
+                && ok "an allowed exec still runs" \
+                || bad "an allowed exec was refused too"
+
+            # And the runtime can still get in, which is what stops enforcement
+            # from bricking every container on the host.
+            docker exec quasar-p6b /bin/sh -c 'exit 0' >/dev/null 2>&1 \
+                && ok "docker exec still works -- the runtime is not refused" \
+                || bad "the runtime itself was refused; no container could start"
+
+            sleep 1
+            assert_some "a refusal is reported as blocked" \
+                'r["source"] == "quasar-p6b" and r.get("path") == "/bin/uname" and r.get("outcome") == "blocked"'
+
+            # Trip the deadman deliberately. One shell, many refusals, well
+            # inside the window -- what a genuinely wrong policy looks like.
+            docker exec quasar-p6b /bin/sh -c \
+                'for i in $(seq 30); do /bin/uname -a; done' >/dev/null 2>&1
+            sleep 2
+
+            if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
+                ok "the deadman disarmed enforcement after too many refusals"
+            else
+                bad "enforcement was still on after the deadman should have tripped"
+            fi
+
+            # Userspace notices on its next heartbeat rather than instantly:
+            # the kernel is the authority, this is the alert.
+            sleep 12
+            stop_quasar
+            grep -q 'DEADMAN TRIPPED' "$WORK/quasar.log" \
+                && ok "the trip is reported to the operator" \
+                || bad "the deadman tripped silently"
+        }
+
+        # --revert-after, which is just the lease: past the deadline nothing is
+        # renewed, so enforcement lapses without a restart.
+        start_quasar --policy "$POLICY" --enforce quasar-p6b --revert-after 15s && {
+            docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1 \
+                && bad "enforcement was not on at the start of the revert-after run" \
+                || ok "enforcement is on before the deadline"
+
+            sleep 20
+            docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1 \
+                && ok "enforcement lapsed after --revert-after, with no restart" \
+                || bad "enforcement was still on past --revert-after"
+
+            stop_quasar
+            grep -q 'revert-after elapsed' "$WORK/quasar.log" \
+                && ok "the reversion is reported" \
+                || bad "the reversion was silent"
+        }
+
+        # Enforcing a policy that allows nothing would stop the container doing
+        # anything at all, so it is refused rather than obeyed.
+        EMPTY=$WORK/p6b-empty
+        mkdir -p "$EMPTY"
+        printf '[meta]\nlearned_from = "test"\n' > "$EMPTY/quasar-p6b.toml"
+        start_quasar --policy "$EMPTY" --enforce quasar-p6b && {
+            docker exec quasar-p6b /bin/echo still-here >/dev/null 2>&1 \
+                && ok "an empty policy is not enforced" \
+                || bad "an empty policy bricked the container"
+            stop_quasar
+            grep -q 'refusing to enforce' "$WORK/quasar.log" \
+                && ok "refusing to enforce an empty policy is reported" \
+                || bad "the refusal was silent"
         }
     fi
 fi

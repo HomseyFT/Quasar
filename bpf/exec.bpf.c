@@ -17,6 +17,9 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+/* vmlinux.h carries types, not errno values. This is the one we return. */
+#define EPERM 1
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
@@ -89,6 +92,62 @@ static __always_inline __u8 mode_now(__u64 cgroup_id)
 		return QUASAR_MODE_OFF;
 
 	return state->mode;
+}
+
+/* Whether the container runtime is entering the container, rather than the
+ * container executing something of its own.
+ *
+ * runc copies itself into a memfd and execs the descriptor, so container init
+ * and every `docker exec` arrive as /proc/self/fd/N -- a path that is never in
+ * the allowlist, because a file descriptor number is a slot the container
+ * controls rather than an identity. Refusing it would stop every container on
+ * the host from starting.
+ *
+ * The signal used instead is structural: the runtime runs on the host, so its
+ * cgroup is not the container's. A process inside a container cannot give
+ * itself a parent outside its own cgroup, so unlike any path string this is
+ * not something the container can arrange.
+ */
+static __always_inline int entered_from_outside(__u64 cgroup_id)
+{
+	struct task_struct *task;
+	__u64 parent_cgroup;
+
+	task = (struct task_struct *)bpf_get_current_task();
+	parent_cgroup = BPF_CORE_READ(task, real_parent, cgroups, dfl_cgrp, kn, id);
+
+	return parent_cgroup != cgroup_id;
+}
+
+/* Count a refusal, and stop enforcing if there have been too many.
+ *
+ * Returns whether the deadman tripped. The state is written back through the
+ * map, so the disarm holds even if userspace is gone -- which is the failure
+ * this rail exists for. A userspace that is alive will notice on its next
+ * renewal, because renewal reads before it writes.
+ */
+static __always_inline int note_block(__u64 cgroup_id)
+{
+	struct enforce_state *state;
+	__u64 now;
+
+	state = bpf_map_lookup_elem(&enforce, &cgroup_id);
+	if (!state)
+		return 1; /* already gone: nothing to enforce */
+
+	now = bpf_ktime_get_ns();
+	if (now - state->window_start_ns > QUASAR_DEADMAN_WINDOW_NS) {
+		state->window_start_ns = now;
+		state->blocks = 0;
+	}
+
+	state->blocks++;
+	if (state->blocks > QUASAR_DEADMAN_BLOCKS) {
+		state->mode = QUASAR_MODE_OFF;
+		return 1;
+	}
+
+	return 0;
 }
 
 /* Fill a scratch key from a NUL-terminated kernel string.
@@ -198,9 +257,10 @@ int quasar_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 /* Runs before the exec is committed, which is what makes refusing possible.
  *
- * This phase never refuses. The branch that returns -EPERM does not exist
- * here, so no bug in arming, expiry or the allowlist can stop a process from
- * running: the worst case is a log line. */
+ * In dry run this only reports. Under enforcement it refuses, and every refusal
+ * is counted against the deadman -- which disarms in here, not in userspace,
+ * so a container cannot be left unable to execute anything by a monitor that
+ * died holding the switch down. */
 SEC("lsm/bprm_check_security")
 int BPF_PROG(quasar_bprm_check, struct linux_binprm *bprm, int ret)
 {
@@ -208,6 +268,7 @@ int BPF_PROG(quasar_bprm_check, struct linux_binprm *bprm, int ret)
 	struct exec_event *e;
 	struct exec_key *key;
 	__u64 cgroup_id;
+	__u8 mode;
 	int len;
 
 	/* Another LSM already refused. Never overturn a denial. */
@@ -215,7 +276,13 @@ int BPF_PROG(quasar_bprm_check, struct linux_binprm *bprm, int ret)
 		return ret;
 
 	cgroup_id = bpf_get_current_cgroup_id();
-	if (mode_now(cgroup_id) == QUASAR_MODE_OFF)
+	mode = mode_now(cgroup_id);
+	if (mode == QUASAR_MODE_OFF)
+		return 0;
+
+	/* The runtime entering the container. Not the container's behaviour,
+	 * and refusing it would stop the container existing. */
+	if (entered_from_outside(cgroup_id))
 		return 0;
 
 	key = bpf_map_lookup_elem(&scratch, &slot);
@@ -226,9 +293,25 @@ int BPF_PROG(quasar_bprm_check, struct linux_binprm *bprm, int ret)
 	if (allowed(key, len))
 		return 0;
 
-	e = emit(key, len, QUASAR_OUTCOME_WOULD_BLOCK);
+	if (mode != QUASAR_MODE_ENFORCE) {
+		e = emit(key, len, QUASAR_OUTCOME_WOULD_BLOCK);
+		if (e)
+			bpf_ringbuf_submit(e, 0);
+		return 0;
+	}
+
+	/* The refusal that trips the deadman is let through. Erring toward
+	 * running is the whole point of having the rail. */
+	if (note_block(cgroup_id)) {
+		e = emit(key, len, QUASAR_OUTCOME_WOULD_BLOCK);
+		if (e)
+			bpf_ringbuf_submit(e, 0);
+		return 0;
+	}
+
+	e = emit(key, len, QUASAR_OUTCOME_BLOCKED);
 	if (e)
 		bpf_ringbuf_submit(e, 0);
 
-	return 0;
+	return -EPERM;
 }

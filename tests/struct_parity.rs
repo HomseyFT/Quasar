@@ -124,14 +124,16 @@ fn exec_key_layout_is_pinned() {
 /// takes effect.
 #[test]
 fn enforce_state_layout_is_pinned() {
-    assert_eq!(size_of::<EnforceState>(), 16, "enforce_state size");
+    assert_eq!(size_of::<EnforceState>(), 24, "enforce_state size");
     assert_eq!(align_of::<EnforceState>(), 8);
     assert_eq!(offset_of!(EnforceState, expires_at_ns), 0);
-    assert_eq!(offset_of!(EnforceState, mode), 8);
-    assert_eq!(offset_of!(EnforceState, _reserved), 9);
+    assert_eq!(offset_of!(EnforceState, window_start_ns), 8);
+    assert_eq!(offset_of!(EnforceState, blocks), 16);
+    assert_eq!(offset_of!(EnforceState, mode), 20);
+    assert_eq!(offset_of!(EnforceState, _reserved), 21);
     assert_eq!(
         size_of::<EnforceState>(),
-        size_of::<u64>() + 1 + 7,
+        size_of::<u64>() * 2 + size_of::<u32>() + 1 + 3,
         "enforce_state must have no implicit padding"
     );
 }

@@ -357,6 +357,21 @@ stops honouring the arming within a lease, with no cooperation from the process
 that is no longer running. The dry run proves that machinery while the failure
 mode is still only "we stop logging".
 
+**The runtime is exempt structurally, not by path.** runc copies itself into a
+memfd and execs the descriptor, so container init and every `docker exec` arrive
+as `/proc/self/fd/N` -- a path that is deliberately never in the allowlist.
+Refusing it would stop every container on the host from starting. The signal
+used instead is that the runtime runs on the host, so its cgroup is not the
+container's: `real_parent->cgroups->dfl_cgrp->kn->id` differs from the current
+cgroup id. A process inside a container cannot give itself a parent outside its
+own cgroup, so unlike a path string this is not something it can arrange. This
+is the answer phase 4c said it would be, and it closes the gap 4c accepted.
+
+The path-shaped exemption in `policy/mod.rs` stays, and does a different job: it
+decides whether a *tracepoint observation* is worth alerting on, where a false
+negative is a missed alert. The structural check decides whether to *block*,
+where a false negative is an execution.
+
 Attach `bpf_lsm_bprm_check_security`, return `-EPERM` for a disallowed exec.
 Two mandatory safety rails:
 
@@ -364,6 +379,24 @@ Two mandatory safety rails:
   A cron job you forgot about will appear here; that is the point.
 - **Deadman switch.** More than N blocks in M seconds auto-disarms enforcement
   and fires an alert. `--revert-after <duration>` disarms on a timer regardless.
+
+  **It counts and disarms in the kernel**, because the failure it exists for is
+  a policy wrong enough to break a container, and that failure does not become
+  less likely when userspace is also gone. Userspace notices on its next
+  heartbeat and alerts. Renewal therefore reads before it writes: a heartbeat
+  that blindly rewrote the arming would resurrect enforcement the kernel had
+  just abandoned, and reset the deadman's counters while doing it.
+
+  The exec that trips the deadman is let through. Erring toward running is the
+  entire purpose of the rail.
+
+  `--revert-after` is the lease rather than a second mechanism: past the
+  deadline nothing is renewed, and the arming expires on its own.
+
+- **An unusable policy is refused.** A policy with no exec allow rules permits
+  nothing, so enforcing it would stop the container executing anything. quasar
+  keeps observing and says why it will not arm -- it must never be the reason
+  the host has no monitoring.
 
 Arm per-container, starting with something you can afford to break. Not forgejo,
 not traefik, not cloudflared.

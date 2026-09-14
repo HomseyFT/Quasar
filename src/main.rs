@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -12,13 +11,13 @@ use anyhow::{Context, Result};
 use aya::maps::RingBuf;
 use clap::{Args, Parser, Subcommand};
 use quasar::{
-    enforce::{Armory, RENEW},
-    event::{ConnectEvent, Event, ExecEvent},
+    enforce::{self, Armory, Mode, Renewal, LEASE, RENEW},
+    event::{ConnectEvent, Event, ExecEvent, QUASAR_DEADMAN_BLOCKS, QUASAR_DEADMAN_WINDOW_NS},
     loader::{self, DropCounter},
     policy::{
         learn,
         sync::{manual_deny_count, MapSync},
-        PolicySet,
+        Decision, PolicySet,
     },
     registry::{Attribution, ContainerChange, Registry},
     sink::{
@@ -156,6 +155,16 @@ struct RunArgs {
     #[arg(long = "dry-run", value_name = "CONTAINER")]
     dry_run: Vec<String>,
 
+    /// Enforce this container's policy: an exec it does not allow fails with
+    /// EPERM. Repeatable. Run a dry run first.
+    #[arg(long, value_name = "CONTAINER")]
+    enforce: Vec<String>,
+
+    /// Disarm everything after this long, whatever happens. `30s`, `15m`,
+    /// `2h`, `7d`. Past the deadline the leases simply stop being renewed.
+    #[arg(long, value_name = "DURATION", value_parser = enforce::parse_duration)]
+    revert_after: Option<Duration>,
+
     /// Serve a live event tail and counters on this unix socket for
     /// `quasar top`. Without it the daemon has no socket at all.
     #[arg(long, value_name = "PATH")]
@@ -200,11 +209,12 @@ async fn run(args: &RunArgs) -> Result<()> {
 
     // The LSM hook is attached only when something asked for it, so a kernel
     // without BPF LSM runs everything else exactly as before.
-    let requested: BTreeSet<String> = args.dry_run.iter().cloned().collect();
-    let mut armory = Armory::take(&mut exec_ebpf, requested)?;
+    let requested = enforce::requests(&args.dry_run, &args.enforce)?;
+    let mut armory = Armory::take(&mut exec_ebpf, requested, args.revert_after)?;
     if armory.requested().next().is_some() {
         loader::attach_lsm(&mut exec_ebpf)?;
     }
+    refuse_unusable_enforcement(&mut armory, &policies);
 
     let exec_kernel_drops = DropCounter::take(&mut exec_ebpf, "exec")?;
     let connect_kernel_drops = DropCounter::take(&mut connect_ebpf, "connect")?;
@@ -232,8 +242,12 @@ async fn run(args: &RunArgs) -> Result<()> {
 
     // A container's cgroup id changes every time it starts, so its allowlist
     // has to be rewritten under the new id or nothing matches.
+    let alert_drops = Arc::new(AtomicU64::new(0));
+    let alerts = spawn_alerter(args.ntfy.as_deref(), Arc::clone(&alert_drops))?;
+
     let resync = tokio::spawn({
         let policies = Arc::clone(&policies);
+        let alerts = alerts.clone();
         async move {
             // The same task renews the arming leases, because it owns the
             // arming map. A lease that stops being renewed expires, and the
@@ -256,8 +270,10 @@ async fn run(args: &RunArgs) -> Result<()> {
                                 }
                                 // Arming is keyed on a cgroup id that changed.
                                 match armory.arm(&name, cgroup_id) {
-                                    Ok(true) => eprintln!("quasar: {name} armed for a dry run"),
-                                    Ok(false) => {}
+                                    Ok(Some(mode)) => {
+                                        eprintln!("quasar: {name} armed, {}", mode.label());
+                                    }
+                                    Ok(None) => {}
                                     Err(error) => {
                                         eprintln!("quasar: arming {name} failed: {error:#}");
                                     }
@@ -274,8 +290,11 @@ async fn run(args: &RunArgs) -> Result<()> {
                         }
                     }
                     _ = heartbeat.tick() => {
-                        if let Err(error) = armory.renew() {
-                            eprintln!("quasar: renewing the arming leases failed: {error:#}");
+                        match armory.renew() {
+                            Ok(renewal) => report_renewal(&renewal, alerts.as_ref()),
+                            Err(error) => {
+                                eprintln!("quasar: renewing the arming leases failed: {error:#}");
+                            }
                         }
                     }
                 }
@@ -299,9 +318,6 @@ async fn run(args: &RunArgs) -> Result<()> {
                 args.socket.as_deref().unwrap_or(Path::new("")).display()
             );
         });
-
-    let alert_drops = Arc::new(AtomicU64::new(0));
-    let alerts = spawn_alerter(args.ntfy.as_deref(), Arc::clone(&alert_drops))?;
 
     let consumer = tokio::spawn({
         let registry = Arc::clone(&registry);
@@ -546,14 +562,81 @@ async fn arm_all(armory: &mut Armory, registry: &Registry) {
         }
     }
 
-    let waiting: Vec<&String> = armory.requested().collect();
+    let asked: Vec<String> = armory
+        .requested()
+        .map(|(name, mode)| format!("{name} ({})", mode.label()))
+        .collect();
+
     eprintln!(
-        "quasar: dry run armed for {} of {} requested containers ({:?} requested)",
+        "quasar: armed {} of {} requested containers: {}",
         armory.armed_count(),
-        waiting.len(),
-        waiting
+        asked.len(),
+        asked.join(", ")
     );
-    eprintln!("quasar: nothing will be prevented -- this phase only reports");
+
+    if armory.requested().any(|(_, mode)| *mode == Mode::Enforce) {
+        eprintln!(
+            "quasar: enforcement is live. It disarms itself after {} refusals in {}s, \
+             and lapses within {}s if this process stops renewing it.",
+            QUASAR_DEADMAN_BLOCKS,
+            QUASAR_DEADMAN_WINDOW_NS / 1_000_000_000,
+            LEASE.as_secs()
+        );
+    }
+}
+
+/// Refuse to enforce a policy that could not let a container run.
+///
+/// An empty exec allowlist under enforcement means the container can execute
+/// nothing, which is a brick rather than a policy. The daemon still starts and
+/// still observes -- it must never be the reason the host has no monitoring --
+/// but it will not arm this.
+fn refuse_unusable_enforcement(armory: &mut Armory, policies: &PolicySet) {
+    let unusable: Vec<String> = armory
+        .requested()
+        .filter(|(_, mode)| **mode == Mode::Enforce)
+        .filter(|(name, _)| {
+            policies
+                .by_container
+                .get(*name)
+                .is_none_or(|policy| !policy.can_govern())
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for name in unusable {
+        eprintln!(
+            "quasar: refusing to enforce {name}: its policy allows no exec at all, \
+             which would stop it running anything. Learn a policy first."
+        );
+        armory.forget(&name);
+    }
+}
+
+/// The deadman tripping is the loudest thing quasar can say. It means a policy
+/// was wrong enough that a container was being broken by it.
+fn report_renewal(renewal: &Renewal, alerts: Option<&mpsc::Sender<Alert>>) {
+    if renewal.reverted {
+        eprintln!("quasar: --revert-after elapsed, everything disarmed");
+    }
+
+    for name in &renewal.tripped {
+        eprintln!(
+            "quasar: DEADMAN TRIPPED for {name} -- too many execs refused too fast, \
+             enforcement is off for it"
+        );
+
+        if let Some(tx) = alerts {
+            let _ = tx.try_send(Alert {
+                key: AlertKey {
+                    container: name.clone(),
+                    decision: Decision::Denied,
+                    subject: "enforcement disarmed itself".to_owned(),
+                },
+                detail: "too many execs refused too fast; the policy is wrong".to_owned(),
+            });
+        }
+    }
 }
 
 async fn sync_all(sync: &mut MapSync, policies: &PolicySet, registry: &Registry) {

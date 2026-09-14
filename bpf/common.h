@@ -41,6 +41,15 @@ typedef uint64_t __u64;
 #define QUASAR_MODE_DRY_RUN 1
 #define QUASAR_MODE_ENFORCE 2
 
+/* The deadman.
+ *
+ * A container refusing this many execs this fast is not being protected, it is
+ * being broken -- a policy that missed something the container genuinely needs
+ * looks exactly like this. Enforcement stops, and it stops in the kernel, so
+ * it stops whether or not there is a userspace left to notice. */
+#define QUASAR_DEADMAN_BLOCKS    20
+#define QUASAR_DEADMAN_WINDOW_NS 10000000000ULL /* 10s */
+
 /* Field order is chosen so the struct packs with no interior padding and no
  * tail padding: 8-byte scalars, then 4-byte scalars, then the arrays. */
 struct exec_event {
@@ -149,8 +158,10 @@ struct cidr_key6 {
  */
 struct enforce_state {
 	__u64 expires_at_ns;
+	__u64 window_start_ns; /* the deadman's current window */
+	__u32 blocks;          /* refusals inside it */
 	__u8  mode;            /* QUASAR_MODE_* */
-	__u8  _reserved[7];
+	__u8  _reserved[3];
 };
 
 #endif /* QUASAR_COMMON_H */
