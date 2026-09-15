@@ -28,7 +28,12 @@ use quasar::{
     },
     tui,
 };
-use tokio::{io::unix::AsyncFd, sync::mpsc, time::MissedTickBehavior};
+use tokio::{
+    io::unix::AsyncFd,
+    signal::unix::{signal, SignalKind},
+    sync::mpsc,
+    time::MissedTickBehavior,
+};
 
 /// Bounded so a container in a crash-loop cannot grow the queue without limit.
 /// Overflow is counted and reported rather than allowed to stall the drain.
@@ -394,6 +399,12 @@ async fn run(args: &RunArgs) -> Result<()> {
          fentry on tcp_v4_connect/tcp_v6_connect/udp_sendmsg, ctrl-c to stop"
     );
 
+    // A terminal sends SIGINT; systemd sends SIGTERM. Both mean stop, and
+    // ignoring the second would mean being killed mid-write rather than
+    // flushing the log and detaching.
+    let mut terminate =
+        signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+
     let mut dropped: u64 = 0;
     loop {
         tokio::select! {
@@ -401,6 +412,7 @@ async fn run(args: &RunArgs) -> Result<()> {
                 signal.context("waiting for ctrl-c")?;
                 break;
             }
+            _ = terminate.recv() => break,
             readable = exec_ring.readable_mut() => {
                 let mut guard = readable.context("polling the exec ring buffer")?;
                 drain(guard.get_inner_mut(), decode_exec, &tx, &mut dropped);

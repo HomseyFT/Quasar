@@ -455,12 +455,34 @@ still.
 
 ```
 make build     # cargo build --release --target x86_64-unknown-linux-musl
-make deploy    # scp binary + policy/, systemctl restart quasar
+make deploy    # binary, unit and policy/, then restart the service
+make logs      # journalctl -u quasar -f on the server
 ```
 
-Policy files deploy with the binary. The service must start cleanly with no
-policy at all (observe everything, alert on nothing) so a bad policy file can
-never prevent startup.
+| | |
+|---|---|
+| Binary | `/usr/local/bin/quasar` |
+| Unit | `/etc/systemd/system/quasar.service` (from `deploy/`) |
+| Policy | `/etc/quasar/policy/*.toml`, mode 0700/0600 |
+| Extra arguments | `/etc/quasar/quasar.conf`, `QUASAR_ARGS=` |
+| Log | `/var/log/quasar/events.jsonl`, directory mode 0700 |
+| Socket | `/run/quasar.sock`, mode 0600 |
+
+Policy files deploy with the binary, and are copied rather than synced: removing
+one is a decision, not a side effect of it being absent from a checkout.
+
+`--ntfy`, `--dry-run` and `--enforce` go in `quasar.conf` rather than the unit,
+so upgrading the unit cannot silently discard them -- in particular cannot
+silently discard the fact that something is being enforced.
+
+The service must start cleanly with no policy at all (observe everything, alert
+on nothing) so a bad policy file can never prevent startup. It runs `--quiet`:
+stdout goes to the journal, and one line per event is over a million journal
+lines a day at the measured rate. The JSONL log is the durable record.
+
+**The daemon stops on SIGTERM as well as SIGINT.** systemd sends the former, and
+handling only the latter meant being killed mid-write instead of flushing the
+log and detaching.
 
 ## Risks
 

@@ -5,7 +5,7 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 BIN         := target/$(MUSL_TARGET)/release/quasar
 TARGET_BTF  := testdata/btf/ubuntu-6.8.0-139
 
-.PHONY: all build dev run test accept lint vmlinux deps deploy soak clean
+.PHONY: all build dev run test accept lint vmlinux deps deploy logs soak clean
 
 all: build
 
@@ -48,9 +48,35 @@ $(TARGET_BTF):
 	@echo "scripts/probe-target.sh."
 	@false
 
+## deploy: binary, unit and policy to the server, then restart the service
+# Policy files are copied, never deleted: removing one is a decision, not a
+# side effect of it being absent from this checkout.
 deploy: build
 	scp $(BIN) $(DEPLOY_HOST):/tmp/quasar
-	ssh -t $(DEPLOY_HOST) 'sudo install -m 755 /tmp/quasar $(DEPLOY_PATH)'
+	scp deploy/quasar.service $(DEPLOY_HOST):/tmp/quasar.service
+	@test -d policy \
+	    && { echo "shipping policy/"; \
+	         ssh $(DEPLOY_HOST) 'mkdir -p /tmp/quasar-policy'; \
+	         scp policy/*.toml $(DEPLOY_HOST):/tmp/quasar-policy/ 2>/dev/null || true; } \
+	    || echo "no policy/ in this checkout -- quasar will observe and alert on nothing"
+	ssh -t $(DEPLOY_HOST) 'set -e; \
+	    sudo install -m 755 /tmp/quasar $(DEPLOY_PATH); \
+	    sudo install -d -m 700 /etc/quasar /etc/quasar/policy; \
+	    sudo install -m 644 /tmp/quasar.service /etc/systemd/system/quasar.service; \
+	    if [ -d /tmp/quasar-policy ]; then \
+	        sudo cp /tmp/quasar-policy/*.toml /etc/quasar/policy/ 2>/dev/null || true; \
+	        sudo chmod 600 /etc/quasar/policy/*.toml 2>/dev/null || true; \
+	        rm -rf /tmp/quasar-policy; \
+	    fi; \
+	    rm -f /tmp/quasar /tmp/quasar.service; \
+	    sudo systemctl daemon-reload; \
+	    sudo systemctl enable --now quasar; \
+	    sudo systemctl restart quasar; \
+	    sleep 2; sudo systemctl --no-pager --full status quasar'
+
+## logs: follow what the deployed service is saying
+logs:
+	ssh -t $(DEPLOY_HOST) 'sudo journalctl -u quasar -f'
 
 ## soak: ship the overhead benchmark to the server and print how to run it
 soak: deploy

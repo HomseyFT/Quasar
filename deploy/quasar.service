@@ -1,0 +1,63 @@
+[Unit]
+Description=quasar eBPF container security monitor
+Documentation=https://github.com/nathan/quasar
+# The registry resolves container names through the Docker socket. quasar runs
+# without it -- events are attributed by cgroup id either way -- so this orders
+# the two rather than requiring one.
+After=network-online.target docker.service
+Wants=docker.service
+
+# A crash loop should stop and stay stopped rather than reattach forever.
+# These live in [Unit]; systemd ignores them in [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Root is not a choice: unprivileged_bpf_disabled=2 and perf_event_paranoid=4
+# on the target rule out anything less.
+User=root
+
+# --quiet because stdout goes to the journal, and one line per event is well
+# over a million journal lines a day at the measured rate. The durable record
+# is the JSONL log.
+#
+# No policy directory is required. A missing or empty one means quasar observes
+# everything and alerts on nothing, which is the correct failure mode: a bad
+# policy file must never be the reason this host has no monitoring.
+#
+# Put --ntfy, --dry-run and --enforce in /etc/quasar/quasar.conf rather than
+# here, so upgrading the unit does not discard them.
+EnvironmentFile=-/etc/quasar/quasar.conf
+ExecStart=/usr/local/bin/quasar run \
+    --quiet \
+    --jsonl /var/log/quasar/events.jsonl \
+    --policy /etc/quasar/policy \
+    --socket /run/quasar.sock \
+    $QUASAR_ARGS
+
+Restart=on-failure
+RestartSec=5s
+
+# Security telemetry: every exec and every destination on this host.
+LogsDirectory=quasar
+LogsDirectoryMode=0700
+
+# Modest, deliberately. Heavier sandboxing interacts badly with BPF loading in
+# ways that surface as an unloadable probe at three in the morning; these are
+# the ones that cannot.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+# Left alone on purpose: the registry walks /sys/fs/cgroup to resolve a cgroup
+# id to a container, and that walk is the core of the whole project.
+ProtectControlGroups=no
+
+# Harmless on 5.11+, where BPF memory is charged to the cgroup instead, and it
+# keeps an older kernel from refusing to load the maps.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

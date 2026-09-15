@@ -1,0 +1,13 @@
+# Extra arguments for quasar, appended to the ones in the unit.
+# Copy to /etc/quasar/quasar.conf. Restart quasar after editing.
+
+# Alerts. Any ntfy topic URL, self-hosted or ntfy.sh.
+#QUASAR_ARGS=--ntfy https://ntfy.example.com/quasar
+
+# Report what enforcement would do for a container, preventing nothing.
+# Run this for a week before enforcing anything.
+#QUASAR_ARGS=--ntfy https://ntfy.example.com/quasar --dry-run marist-backend
+
+# Enforce. Start with one container you can afford to break, and keep
+# --revert-after set until you have watched it through a full day.
+#QUASAR_ARGS=--ntfy https://ntfy.example.com/quasar --enforce marist-backend --revert-after 12h
