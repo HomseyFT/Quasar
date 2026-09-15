@@ -1,1 +1,5 @@
 /target
+
+# Generated from testdata/btf/ by `make vmlinux`. 151k lines of build
+# output, not source -- regenerate it rather than reading a diff of it.
+/bpf/vmlinux.h
