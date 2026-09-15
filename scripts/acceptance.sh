@@ -708,9 +708,24 @@ if want_phase 6b; then
             else
                 # Trip it deliberately. One shell, many refusals, well inside
                 # the window -- what a genuinely wrong policy looks like.
+                #
+                # The list is literal because `seq` is not in the policy
+                # either: enforcement refuses it, the substitution yields
+                # nothing, and the loop silently runs zero times. Shell
+                # builtins only, so the loop cannot be blocked by the thing
+                # it exists to trigger.
                 docker exec quasar-p6b /bin/sh -c \
-                    'for i in $(seq 30); do /bin/uname -a; done' >/dev/null 2>&1
+                    'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+                              21 22 23 24 25 26 27 28 29 30; do /bin/uname -a; done' \
+                    >/dev/null 2>&1
                 sleep 2
+
+                # If the loop did not actually run, the disarm check below
+                # would pass for the wrong reason.
+                blocked=$(count 'r["source"] == "quasar-p6b" and r.get("outcome") == "blocked"')
+                [ "$blocked" -ge 20 ] \
+                    && ok "the loop produced $blocked refusals to trip on" \
+                    || bad "only $blocked refusals reached the deadman; the loop did not run"
 
                 if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
                     ok "the deadman disarmed enforcement after too many refusals"
