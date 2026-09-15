@@ -103,10 +103,21 @@ static __always_inline __u8 mode_now(__u64 cgroup_id)
  * controls rather than an identity. Refusing it would stop every container on
  * the host from starting.
  *
- * The signal used instead is structural: the runtime runs on the host, so its
- * cgroup is not the container's. A process inside a container cannot give
- * itself a parent outside its own cgroup, so unlike any path string this is
- * not something the container can arrange.
+ * Two signals, and both are needed.
+ *
+ * The structural one is the gate: the runtime runs on the host, so its cgroup
+ * is not the container's, and a process inside a container cannot give itself
+ * a parent outside its own cgroup. Nothing the container can do reaches this
+ * exemption at all.
+ *
+ * The path shape is what distinguishes the re-exec from its payload. `docker
+ * exec C /bin/nc` runs both from the same process -- runc init execs the memfd
+ * and then execs /bin/nc -- so both have a parent on the host. Exempting on the
+ * parent alone would exempt the payload too, which is to say it would exempt
+ * everything anyone ever ran through `docker exec`.
+ *
+ * The path shape on its own would be forgeable, and on its own it was. Behind
+ * the gate it is not: only processes the runtime created can be looking at it.
  */
 static __always_inline int entered_from_outside(__u64 cgroup_id)
 {
@@ -117,6 +128,20 @@ static __always_inline int entered_from_outside(__u64 cgroup_id)
 	parent_cgroup = BPF_CORE_READ(task, real_parent, cgroups, dfl_cgrp, kn, id);
 
 	return parent_cgroup != cgroup_id;
+}
+
+/* The memfd re-exec itself: /proc/self/fd/<something>. */
+static __always_inline int is_runtime_reexec(const __u8 *path)
+{
+	static const char prefix[] = "/proc/self/fd/";
+	int i;
+
+	for (i = 0; i < sizeof(prefix) - 1; i++) {
+		if (path[i] != (__u8)prefix[i])
+			return 0;
+	}
+
+	return path[i] != 0; /* a bare directory is not an exec */
 }
 
 /* Count a refusal, and stop enforcing if there have been too many.
@@ -280,17 +305,17 @@ int BPF_PROG(quasar_bprm_check, struct linux_binprm *bprm, int ret)
 	if (mode == QUASAR_MODE_OFF)
 		return 0;
 
-	/* The runtime entering the container. Not the container's behaviour,
-	 * and refusing it would stop the container existing. */
-	if (entered_from_outside(cgroup_id))
-		return 0;
-
 	key = bpf_map_lookup_elem(&scratch, &slot);
 	if (!key)
 		return 0;
 
 	len = fill_key(key, cgroup_id, BPF_CORE_READ(bprm, filename));
 	if (allowed(key, len))
+		return 0;
+
+	/* The runtime letting itself in. Not the container's behaviour, and
+	 * refusing it would stop the container existing at all. */
+	if (entered_from_outside(cgroup_id) && is_runtime_reexec(key->path))
 		return 0;
 
 	if (mode != QUASAR_MODE_ENFORCE) {

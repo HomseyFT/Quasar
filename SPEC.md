@@ -357,15 +357,25 @@ stops honouring the arming within a lease, with no cooperation from the process
 that is no longer running. The dry run proves that machinery while the failure
 mode is still only "we stop logging".
 
-**The runtime is exempt structurally, not by path.** runc copies itself into a
-memfd and execs the descriptor, so container init and every `docker exec` arrive
-as `/proc/self/fd/N` -- a path that is deliberately never in the allowlist.
-Refusing it would stop every container on the host from starting. The signal
-used instead is that the runtime runs on the host, so its cgroup is not the
-container's: `real_parent->cgroups->dfl_cgrp->kn->id` differs from the current
-cgroup id. A process inside a container cannot give itself a parent outside its
-own cgroup, so unlike a path string this is not something it can arrange. This
-is the answer phase 4c said it would be, and it closes the gap 4c accepted.
+**The runtime is exempt on two signals, and both are needed.** runc copies
+itself into a memfd and execs the descriptor, so container init and every
+`docker exec` arrive as `/proc/self/fd/N` -- a path deliberately never in the
+allowlist. Refusing it would stop every container on the host from starting.
+
+The structural signal is the gate: the runtime runs on the host, so
+`real_parent->cgroups->dfl_cgrp->kn->id` differs from the current cgroup id, and
+a process inside a container cannot give itself a parent outside its own cgroup.
+Nothing the container can do reaches the exemption at all.
+
+The path shape is what separates the re-exec from its payload. `docker exec C
+/bin/nc` runs both from one process -- runc init execs the memfd, then execs
+`/bin/nc` -- so both have a parent on the host. The gate alone would exempt the
+payload too, which is to say it would exempt everything anyone ran through
+`docker exec`. The acceptance suite caught exactly that.
+
+The path shape alone would be forgeable, and was. Behind the gate it is not:
+only processes the runtime created are looking at it. This is the answer phase
+4c said it would be, and it closes the gap 4c accepted.
 
 The path-shaped exemption in `policy/mod.rs` stays, and does a different job: it
 decides whether a *tracepoint observation* is worth alerting on, where a false

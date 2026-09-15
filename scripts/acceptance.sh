@@ -670,10 +670,12 @@ if want_phase 6b; then
 
         start_quasar --policy "$POLICY" --enforce quasar-p6b && {
             # The criterion: refused, and the container is still there.
+            ENFORCING=no
             if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
                 bad "a disallowed exec was NOT refused"
             else
                 ok "a disallowed exec is refused"
+                ENFORCING=yes
             fi
 
             [ "$(docker inspect -f '{{.State.Running}}' quasar-p6b 2>/dev/null)" = "true" ] \
@@ -696,25 +698,34 @@ if want_phase 6b; then
             assert_some "a refusal is reported as blocked" \
                 'r["source"] == "quasar-p6b" and r.get("path") == "/bin/uname" and r.get("outcome") == "blocked"'
 
-            # Trip the deadman deliberately. One shell, many refusals, well
-            # inside the window -- what a genuinely wrong policy looks like.
-            docker exec quasar-p6b /bin/sh -c \
-                'for i in $(seq 30); do /bin/uname -a; done' >/dev/null 2>&1
-            sleep 2
-
-            if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
-                ok "the deadman disarmed enforcement after too many refusals"
+            # The deadman can only be shown to disarm something that was
+            # armed. Without this guard these checks go green when
+            # enforcement never engaged at all, which is the opposite of
+            # what they are for.
+            if [ "$ENFORCING" != yes ]; then
+                bad "skipped the deadman checks: enforcement never engaged"
+                stop_quasar
             else
-                bad "enforcement was still on after the deadman should have tripped"
-            fi
+                # Trip it deliberately. One shell, many refusals, well inside
+                # the window -- what a genuinely wrong policy looks like.
+                docker exec quasar-p6b /bin/sh -c \
+                    'for i in $(seq 30); do /bin/uname -a; done' >/dev/null 2>&1
+                sleep 2
 
-            # Userspace notices on its next heartbeat rather than instantly:
-            # the kernel is the authority, this is the alert.
-            sleep 12
-            stop_quasar
-            grep -q 'DEADMAN TRIPPED' "$WORK/quasar.log" \
-                && ok "the trip is reported to the operator" \
-                || bad "the deadman tripped silently"
+                if docker exec quasar-p6b /bin/uname -a >/dev/null 2>&1; then
+                    ok "the deadman disarmed enforcement after too many refusals"
+                else
+                    bad "enforcement was still on after the deadman should have tripped"
+                fi
+
+                # Userspace notices on its next heartbeat rather than
+                # instantly: the kernel is the authority, this is the alert.
+                sleep 12
+                stop_quasar
+                grep -q 'DEADMAN TRIPPED' "$WORK/quasar.log" \
+                    && ok "the trip is reported to the operator" \
+                    || bad "the deadman tripped silently"
+            fi
         }
 
         # --revert-after, which is just the lease: past the deadline nothing is
